@@ -1,0 +1,53 @@
+# llama-gag example configuration.
+#
+# Every field is optional; omitted fields fall back to the built-in defaults
+# (shown in comments). CLI arguments override this file.
+#
+# Precedence (highest wins): CLI > this file > built-in default.
+
+[server]
+# Address the proxy listens on. Default: "127.0.0.1:8090"
+listen = "127.0.0.1:8090"
+
+[upstream]
+# Base URL of the llama-server (OpenAI-compatible) backend. Default: "http://127.0.0.1:8080"
+endpoint = "http://127.0.0.1:8080"
+
+[detection]
+# Enable incremental loop detection on streaming completions. Default: true
+enabled = true
+# Minimum repeated-block length, in characters. Default: 10
+min_block = 10
+# Maximum repeated-block length, in characters. Default: 2048
+max_block = 2048
+# Minimum number of consecutive repeats to trigger a continuation. Default: 2
+min_repeats = 2
+
+[continuation]
+# User message appended (after the deduplicated assistant turn) to request
+# continuation. Default: "Continue from where you left off. Do not repeat any
+# content already generated."
+prompt = "Continue from where you left off. Do not repeat any content already generated."
+# Maximum number of continuation requests before giving up. Default: 3
+max_retries = 3
+
+[auto_close]
+# When a loop is detected inside an unclosed block (e.g. a think block that
+# never closed), append the matching closing marker so the merged stream stays
+# balanced. Thinking content is preserved; only the closing marker is added.
+# Default: true
+enabled = true
+# Block-marker pairs to auto-close: `open` is the opening marker, `close` the
+# closing marker appended to balance it. Default: one think-block pair.
+# NOTE: the values below are PLACEHOLDERS — replace them with the real
+# markers your model emits.
+blocks = [
+    { open = "<think>", close = "</think>" },
+]
+
+[logging]
+# Log level: trace, debug, info, warn, or error. Default: "info"
+level = "info"
+# Optional: write logs to this file instead of the console. When set, nothing
+# is printed to the console. Default: unset (logs go to the console).
+# file = "/var/log/llama-gag.log"
