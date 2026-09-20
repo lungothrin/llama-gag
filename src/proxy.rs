@@ -26,10 +26,10 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::continuation::{build_continuation_messages, dedup};
-use crate::detector::LoopDetector;
+use crate::detector::{LoopDetector, LoopHit};
 use crate::passthrough;
 use crate::server::AppState;
-use crate::sse::{delta_content, is_usage, SseEvent, SseParser};
+use crate::sse::{delta_content, delta_reasoning, has_finish_reason, is_usage, SseEvent, SseParser};
 
 const DONE: &[u8] = b"data: [DONE]\n\n";
 
@@ -154,10 +154,19 @@ pub struct ProxyStream {
     original_messages: Value,
     /// Current `messages` array (original + latest continuation turns).
     messages: Value,
-    /// Loop detector for the current response (reset per response).
+    /// Loop detector for the current response's `content` (reset per response
+    /// and whenever a new content segment begins).
     detector: Option<LoopDetector>,
+    /// Loop detector for the current response's `reasoning_content` (reset per
+    /// response and whenever a new reasoning segment begins).
+    reasoning_detector: Option<LoopDetector>,
     /// Accumulated `delta.content` for the current response.
     full_text: String,
+    /// Accumulated `delta.reasoning_content` for the current response.
+    reasoning_text: String,
+    /// The last non-empty segment (`true` = reasoning, `false` = content),
+    /// used to detect segment switches so the opposite detector can be reset.
+    last_was_reasoning: Option<bool>,
     /// SSE parser for the current response (reset per response).
     sse: SseParser,
     /// Byte stream of the current upstream response, if any.
@@ -171,6 +180,9 @@ pub struct ProxyStream {
     /// A content chunk (closing block marker) to emit before the next
     /// response's content, when a loop was detected inside an unclosed block.
     pending_injection: Option<Bytes>,
+    /// Whether any upstream chunk carried a non-null `finish_reason`
+    /// (diagnostic: clients such as VS Code expect one before `[DONE]`).
+    finish_reason_seen: bool,
 }
 
 impl ProxyStream {
@@ -193,6 +205,11 @@ impl ProxyStream {
             cfg.max_block,
             cfg.min_repeats,
         ));
+        let reasoning_detector = Some(LoopDetector::new(
+            cfg.min_block,
+            cfg.max_block,
+            cfg.min_repeats,
+        ));
         let messages = original_messages.clone();
         ProxyStream {
             client,
@@ -203,13 +220,17 @@ impl ProxyStream {
             original_messages,
             messages,
             detector,
+            reasoning_detector,
             full_text: String::new(),
+            reasoning_text: String::new(),
+            last_was_reasoning: None,
             sse: SseParser::new(),
             resp: first_resp,
             pending: None,
             continuations: 0,
             done: false,
             pending_injection: None,
+            finish_reason_seen: false,
         }
     }
 
@@ -341,21 +362,79 @@ impl ProxyStream {
 
         let events = self.sse.feed(&bytes);
         let mut got_done = false;
-        let mut hit = None;
+        // `(is_reasoning, hit)`: which field's detector fired.
+        let mut hit: Option<(bool, LoopHit)> = None;
 
         for ev in &events {
             match ev {
                 SseEvent::Data(payload) => {
-                    if let Some(content) = delta_content(payload) {
-                        self.full_text.push_str(&content);
-                        if let Some(det) = self.detector.as_mut() {
-                            for c in content.chars() {
-                                if let Some(h) = det.feed(c) {
-                                    hit = Some(h);
-                                    break;
+                    if has_finish_reason(payload) {
+                        self.finish_reason_seen = true;
+                    }
+                    let reasoning = delta_reasoning(payload);
+                    let content = delta_content(payload);
+                    // Current segment: content takes precedence when both are
+                    // present in one delta (content follows reasoning).
+                    let cur = if content.is_some() {
+                        Some(false)
+                    } else if reasoning.is_some() {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    // On a segment switch, reset the detector of the field we
+                    // are leaving so repetition is never counted across
+                    // separate thinking/content blocks.
+                    if let (Some(cur), Some(last)) = (cur, self.last_was_reasoning) {
+                        if cur != last {
+                            if cur {
+                                // Switching to reasoning: reset content detector.
+                                self.detector = Some(LoopDetector::new(
+                                    self.cfg.min_block,
+                                    self.cfg.max_block,
+                                    self.cfg.min_repeats,
+                                ));
+                            } else {
+                                // Switching to content: reset reasoning detector.
+                                self.reasoning_detector = Some(LoopDetector::new(
+                                    self.cfg.min_block,
+                                    self.cfg.max_block,
+                                    self.cfg.min_repeats,
+                                ));
+                            }
+                        }
+                    }
+                    // Feed reasoning first, then content (model output order).
+                    // Each field has its own detector; a hit in either triggers
+                    // a continuation.
+                    if let Some(r) = &reasoning {
+                        self.reasoning_text.push_str(r);
+                        if hit.is_none() {
+                            if let Some(det) = self.reasoning_detector.as_mut() {
+                                for c in r.chars() {
+                                    if let Some(h) = det.feed(c) {
+                                        hit = Some((true, h));
+                                        break;
+                                    }
                                 }
                             }
                         }
+                    }
+                    if let Some(c) = &content {
+                        self.full_text.push_str(c);
+                        if hit.is_none() {
+                            if let Some(det) = self.detector.as_mut() {
+                                for ch in c.chars() {
+                                    if let Some(h) = det.feed(ch) {
+                                        hit = Some((false, h));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if cur.is_some() {
+                        self.last_was_reasoning = cur;
                     }
                 }
                 SseEvent::Done => got_done = true,
@@ -366,26 +445,38 @@ impl ProxyStream {
         // [DONE] in the same chunk, we still continue (the [DONE] belongs to
         // the discarded looping response). This keeps behavior independent of
         // how the upstream chunks its bytes.
-        if let Some(h) = hit {
-            let kept_base = dedup(&self.full_text, h.kept_chars);
+        if let Some((is_reasoning, h)) = hit {
+            // Deduplicate the field that looped. When the loop is in content,
+            // the (complete) reasoning is preserved in full; when it is in
+            // reasoning, no content has been produced yet.
+            let (mut kept_reasoning, mut kept_content) = if is_reasoning {
+                (dedup(&self.reasoning_text, h.kept_chars), String::new())
+            } else {
+                (self.reasoning_text.clone(), dedup(&self.full_text, h.kept_chars))
+            };
             tracing::info!(
                 %self.req_id,
                 attempt = self.continuations + 1,
+                field = if is_reasoning { "reasoning_content" } else { "content" },
                 block_len = h.block_len,
                 run = h.run,
                 kept_chars = h.kept_chars,
-                kept_len = kept_base.chars().count(),
+                kept_len = kept_reasoning.chars().count() + kept_content.chars().count(),
                 "loop detected, continuing"
             );
             // Auto-close unclosed block markers (e.g. a think block cut off by
-            // the loop). The client already received `full_text`, so close
-            // against it; the assistant message is `kept_base`, so close
-            // against that. Thinking content is preserved, only the closing
-            // marker is appended.
+            // the loop) in the field that looped. The client already received
+            // that field's full text, so close against it; the assistant
+            // message carries the kept text, so close against that.
+            let (loop_full, loop_kept) = if is_reasoning {
+                (&self.reasoning_text, &kept_reasoning)
+            } else {
+                (&self.full_text, &kept_content)
+            };
             let (model_suffix, client_suffix) = if self.cfg.auto_close_enabled {
                 (
-                    close_suffix(&kept_base, &self.cfg.auto_close_blocks),
-                    close_suffix(&self.full_text, &self.cfg.auto_close_blocks),
+                    close_suffix(loop_kept, &self.cfg.auto_close_blocks),
+                    close_suffix(loop_full, &self.cfg.auto_close_blocks),
                 )
             } else {
                 (String::new(), String::new())
@@ -398,10 +489,15 @@ impl ProxyStream {
                     "auto-closing unclosed block marker(s)"
                 );
             }
-            let mut kept = kept_base;
-            kept.push_str(&model_suffix);
+            if is_reasoning {
+                kept_reasoning.push_str(&model_suffix);
+            } else {
+                kept_content.push_str(&model_suffix);
+            }
             let injection = if client_suffix.is_empty() {
                 None
+            } else if is_reasoning {
+                Some(reasoning_chunk_bytes(&client_suffix))
             } else {
                 Some(content_chunk_bytes(&client_suffix))
             };
@@ -409,14 +505,23 @@ impl ProxyStream {
             // accumulate across retries.
             self.messages = build_continuation_messages(
                 &self.original_messages,
-                &kept,
+                &kept_reasoning,
+                &kept_content,
                 &self.cfg.continuation_prompt,
             );
             // Reset per-response state for the continuation.
             self.resp = None;
             self.sse = SseParser::new();
             self.full_text.clear();
+            self.reasoning_text.clear();
+            self.last_was_reasoning = None;
+            self.finish_reason_seen = false;
             self.detector = Some(LoopDetector::new(
+                self.cfg.min_block,
+                self.cfg.max_block,
+                self.cfg.min_repeats,
+            ));
+            self.reasoning_detector = Some(LoopDetector::new(
                 self.cfg.min_block,
                 self.cfg.max_block,
                 self.cfg.min_repeats,
@@ -460,6 +565,7 @@ impl ProxyStream {
         tracing::info!(
             %self.req_id,
             continuations = self.continuations,
+            finish_reason_seen = self.finish_reason_seen,
             reason,
             "stream ended"
         );
@@ -528,6 +634,18 @@ fn content_chunk_bytes(content: &str) -> Bytes {
         "id": "llama-gag",
         "object": "chat.completion.chunk",
         "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
+    });
+    Bytes::from(format!("data: {v}\n\n"))
+}
+
+/// Build a synthetic SSE `data:` chunk carrying `delta.reasoning_content` =
+/// `reasoning`. Used to inject a closing block marker into the merged stream
+/// when the loop was detected in the reasoning field.
+fn reasoning_chunk_bytes(reasoning: &str) -> Bytes {
+    let v = json!({
+        "id": "llama-gag",
+        "object": "chat.completion.chunk",
+        "choices": [{ "index": 0, "delta": { "reasoning_content": reasoning }, "finish_reason": null }]
     });
     Bytes::from(format!("data: {v}\n\n"))
 }

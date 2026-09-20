@@ -117,6 +117,18 @@ pub fn delta_content(data: &str) -> Option<String> {
     v["choices"][0]["delta"]["content"].as_str().map(str::to_string)
 }
 
+/// Extract `choices[0].delta.reasoning_content` from a `data:` payload, if
+/// present.
+///
+/// llama-server (with `--reasoning on`) emits the model's thinking in a
+/// separate `reasoning_content` field. The proxy feeds it to its own loop
+/// detector (separate from `content`) and carries it back in the continuation
+/// request so the upstream template renders it correctly.
+pub fn delta_reasoning(data: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    v["choices"][0]["delta"]["reasoning_content"].as_str().map(str::to_string)
+}
+
 /// Whether a `data:` payload carries a non-null `usage` object.
 ///
 /// llama-server (and OpenAI-compatible servers) emit a final chunk containing
@@ -129,6 +141,19 @@ pub fn is_usage(data: &str) -> bool {
         Err(_) => return false,
     };
     v.get("usage").map(|u| !u.is_null()).unwrap_or(false)
+}
+
+/// Whether a `data:` payload carries a non-null `choices[0].finish_reason`
+/// (the chunk that signals the model finished generating).
+pub fn has_finish_reason(data: &str) -> bool {
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    v["choices"][0]
+        .get("finish_reason")
+        .map(|f| !f.is_null())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

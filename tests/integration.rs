@@ -191,6 +191,16 @@ fn content_chunk(content: &str) -> String {
     format!("data: {v}\n\n")
 }
 
+/// Build a single SSE `data:` chunk carrying `delta.reasoning_content`.
+fn reasoning_chunk(reasoning: &str) -> String {
+    let v = json!({
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "choices": [{ "index": 0, "delta": { "reasoning_content": reasoning }, "finish_reason": null }]
+    });
+    format!("data: {v}\n\n")
+}
+
 const DONE_CHUNK: &str = "data: [DONE]\n\n";
 
 /// A stream wrapper that records when it is dropped. Used to verify the proxy
@@ -501,6 +511,83 @@ async fn d3_stream_loop_continuation() {
     assert_eq!(
         cont_msgs[1],
         json!({ "role": "assistant", "content": "Hello ABCD" })
+    );
+    assert_eq!(
+        cont_msgs[2],
+        json!({ "role": "user", "content": "CONTINUE" })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D14: reasoning_content loop -> detected in the reasoning field (separate
+// detector), and the continuation request carries the deduplicated
+// `reasoning_content` with an empty `content`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn d14_reasoning_loop_continuation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // First request: the model loops in its reasoning. "Let me " +
+            // "ABCD" x2 triggers the reasoning detector (min_block=4,
+            // min_repeats=2) at the 2nd block.
+            sse_response(vec![
+                reasoning_chunk("Let me "),
+                reasoning_chunk("ABCDABCD"),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            // Continuation: a normal completion that ends the stream.
+            sse_response(vec![
+                content_chunk("The answer is 42."),
+                DONE_CHUNK.to_string(),
+            ])
+        }
+    });
+
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let req_body = json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // The client sees only the continuation content (the reasoning was
+    // pass-through in `reasoning_content`, not `content`).
+    let content = extract_content(&bytes);
+    assert_eq!(content, "The answer is 42.");
+
+    // Exactly ONE [DONE] for the whole merged stream.
+    assert_eq!(count_done(&bytes), 1, "merged stream must have a single [DONE]");
+
+    // Two upstream requests: the original + one continuation.
+    let bodies = mock.chat_request_bodies();
+    assert_eq!(bodies.len(), 2, "original + one continuation");
+
+    // The continuation request carries the deduplicated reasoning in
+    // `reasoning_content` (prefix + one block) and an empty `content`.
+    let cont_msgs = bodies[1].get("messages").and_then(Value::as_array).cloned().unwrap();
+    assert_eq!(cont_msgs.len(), 3);
+    assert_eq!(cont_msgs[0], json!({ "role": "user", "content": "hi" }));
+    assert_eq!(
+        cont_msgs[1],
+        json!({ "role": "assistant", "reasoning_content": "Let me ABCD", "content": "" })
     );
     assert_eq!(
         cont_msgs[2],
