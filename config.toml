@@ -19,12 +19,15 @@ endpoint = "http://127.0.0.1:8080"
 [detection]
 # Enable incremental loop detection on streaming completions. Default: true
 enabled = true
-# Minimum repeated-block length, in characters. Default: 10
-min_block = 10
-# Maximum repeated-block length, in characters. Default: 2048
-max_block = 2048
-# Minimum number of consecutive repeats to trigger a continuation. Default: 3
-min_repeats = 3
+# Short tier: minimum repeated-block length, in characters. Default: 8
+short_min_block = 8
+# Short tier: maximum repeated-block length, in characters. Default: 64
+short_max_block = 64
+# Short tier: consecutive repeats needed to trigger a continuation. Default: 3
+short_repeats = 3
+# Long tier: maximum repeated-block length, in characters. Blocks longer than
+# short_max_block trigger after 2 repeats (fixed). Default: 2048
+long_max_block = 2048
 
 [continuation]
 # User message appended (after the deduplicated assistant turn) to request

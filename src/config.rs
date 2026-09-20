@@ -44,17 +44,22 @@ pub struct Cli {
     #[arg(long)]
     pub no_detection: bool,
 
-    /// Minimum repeated-block length in characters.
+    /// Short tier: minimum repeated-block length in characters.
     #[arg(long)]
-    pub min_block: Option<usize>,
+    pub short_min_block: Option<usize>,
 
-    /// Maximum repeated-block length in characters.
+    /// Short tier: maximum repeated-block length in characters.
     #[arg(long)]
-    pub max_block: Option<usize>,
+    pub short_max_block: Option<usize>,
 
-    /// Minimum number of consecutive repeats to trigger.
+    /// Short tier: minimum number of consecutive repeats to trigger.
     #[arg(long)]
-    pub min_repeats: Option<usize>,
+    pub short_repeats: Option<usize>,
+
+    /// Long tier: maximum repeated-block length in characters (blocks longer
+    /// than the short tier trigger after 2 repeats).
+    #[arg(long)]
+    pub long_max_block: Option<usize>,
 
     /// User message injected to request continuation.
     #[arg(long)]
@@ -90,9 +95,14 @@ pub struct Config {
     /// rejected with HTTP 413 before reaching a handler.
     pub max_body_size: usize,
     pub detection_enabled: bool,
-    pub min_block: usize,
-    pub max_block: usize,
-    pub min_repeats: usize,
+    /// Short tier: block lengths in `[short_min_block, short_max_block]`.
+    pub short_min_block: usize,
+    pub short_max_block: usize,
+    /// Short tier: consecutive repeats needed to trigger.
+    pub short_repeats: usize,
+    /// Long tier: block lengths in `[short_max_block + 1, long_max_block]`,
+    /// triggering after 2 repeats (fixed).
+    pub long_max_block: usize,
     pub continuation_prompt: String,
     pub max_retries: usize,
     /// Whether to auto-close unclosed block markers on continuation.
@@ -112,9 +122,10 @@ impl Default for Config {
             upstream: "http://127.0.0.1:8080".to_string(),
             max_body_size: 64 * 1024 * 1024,
             detection_enabled: true,
-            min_block: 10,
-            max_block: 2048,
-            min_repeats: 3,
+            short_min_block: 8,
+            short_max_block: 64,
+            short_repeats: 3,
+            long_max_block: 2048,
             continuation_prompt: "Continue from where you left off. Do not repeat any content already generated."
                 .to_string(),
             max_retries: 3,
@@ -131,14 +142,17 @@ impl Default for Config {
 impl Config {
     /// Validate invariants; return an error message if violated.
     pub fn validate(&self) -> Result<(), String> {
-        if self.min_block == 0 {
-            return Err("detection.min_block must be >= 1".into());
+        if self.short_min_block == 0 {
+            return Err("detection.short_min_block must be >= 1".into());
         }
-        if self.max_block < self.min_block {
-            return Err("detection.max_block must be >= detection.min_block".into());
+        if self.short_max_block < self.short_min_block {
+            return Err("detection.short_max_block must be >= detection.short_min_block".into());
         }
-        if self.min_repeats == 0 {
-            return Err("detection.min_repeats must be >= 1".into());
+        if self.short_repeats == 0 {
+            return Err("detection.short_repeats must be >= 1".into());
+        }
+        if self.long_max_block < self.short_max_block {
+            return Err("detection.long_max_block must be >= detection.short_max_block".into());
         }
         if self.max_retries == 0 {
             return Err("continuation.max_retries must be >= 1".into());
@@ -184,9 +198,10 @@ struct UpstreamSection {
 #[derive(Debug, Default, Deserialize)]
 struct DetectionSection {
     enabled: Option<bool>,
-    min_block: Option<usize>,
-    max_block: Option<usize>,
-    min_repeats: Option<usize>,
+    short_min_block: Option<usize>,
+    short_max_block: Option<usize>,
+    short_repeats: Option<usize>,
+    long_max_block: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -230,14 +245,17 @@ pub fn load(cli: &Cli) -> Result<Config, String> {
         if let Some(v) = file.detection.enabled {
             cfg.detection_enabled = v;
         }
-        if let Some(v) = file.detection.min_block {
-            cfg.min_block = v;
+        if let Some(v) = file.detection.short_min_block {
+            cfg.short_min_block = v;
         }
-        if let Some(v) = file.detection.max_block {
-            cfg.max_block = v;
+        if let Some(v) = file.detection.short_max_block {
+            cfg.short_max_block = v;
         }
-        if let Some(v) = file.detection.min_repeats {
-            cfg.min_repeats = v;
+        if let Some(v) = file.detection.short_repeats {
+            cfg.short_repeats = v;
+        }
+        if let Some(v) = file.detection.long_max_block {
+            cfg.long_max_block = v;
         }
         if let Some(v) = file.continuation.prompt {
             cfg.continuation_prompt = v;
@@ -274,14 +292,17 @@ pub fn load(cli: &Cli) -> Result<Config, String> {
     } else if cli.detection {
         cfg.detection_enabled = true;
     }
-    if let Some(v) = cli.min_block {
-        cfg.min_block = v;
+    if let Some(v) = cli.short_min_block {
+        cfg.short_min_block = v;
     }
-    if let Some(v) = cli.max_block {
-        cfg.max_block = v;
+    if let Some(v) = cli.short_max_block {
+        cfg.short_max_block = v;
     }
-    if let Some(v) = cli.min_repeats {
-        cfg.min_repeats = v;
+    if let Some(v) = cli.short_repeats {
+        cfg.short_repeats = v;
+    }
+    if let Some(v) = cli.long_max_block {
+        cfg.long_max_block = v;
     }
     if let Some(v) = &cli.prompt {
         cfg.continuation_prompt = v.clone();
@@ -321,9 +342,10 @@ mod tests {
             max_body_size: None,
             detection: false,
             no_detection: false,
-            min_block: None,
-            max_block: None,
-            min_repeats: None,
+            short_min_block: None,
+            short_max_block: None,
+            short_repeats: None,
+            long_max_block: None,
             prompt: None,
             max_retries: None,
             auto_close: false,
@@ -352,9 +374,10 @@ mod tests {
         assert_eq!(cfg.listen, "127.0.0.1:8090");
         assert_eq!(cfg.upstream, "http://127.0.0.1:8080");
         assert!(cfg.detection_enabled);
-        assert_eq!(cfg.min_block, 10);
-        assert_eq!(cfg.max_block, 2048);
-        assert_eq!(cfg.min_repeats, 3);
+        assert_eq!(cfg.short_min_block, 8);
+        assert_eq!(cfg.short_max_block, 64);
+        assert_eq!(cfg.short_repeats, 3);
+        assert_eq!(cfg.long_max_block, 2048);
         assert_eq!(cfg.max_retries, 3);
         assert!(!cfg.continuation_prompt.is_empty());
     }
@@ -370,9 +393,10 @@ listen = "0.0.0.0:9999"
 endpoint = "http://10.0.0.5:1234"
 [detection]
 enabled = false
-min_block = 5
-max_block = 500
-min_repeats = 3
+short_min_block = 5
+short_max_block = 500
+short_repeats = 3
+long_max_block = 1024
 [continuation]
 prompt = "go on"
 max_retries = 7
@@ -382,9 +406,10 @@ max_retries = 7
         assert_eq!(cfg.listen, "0.0.0.0:9999");
         assert_eq!(cfg.upstream, "http://10.0.0.5:1234");
         assert!(!cfg.detection_enabled);
-        assert_eq!(cfg.min_block, 5);
-        assert_eq!(cfg.max_block, 500);
-        assert_eq!(cfg.min_repeats, 3);
+        assert_eq!(cfg.short_min_block, 5);
+        assert_eq!(cfg.short_max_block, 500);
+        assert_eq!(cfg.short_repeats, 3);
+        assert_eq!(cfg.long_max_block, 1024);
         assert_eq!(cfg.continuation_prompt, "go on");
         assert_eq!(cfg.max_retries, 7);
     }
@@ -395,17 +420,19 @@ max_retries = 7
         let mut cli = default_cli();
         cli.listen = Some("1.2.3.4:1".into());
         cli.upstream = Some("http://x:2".into());
-        cli.min_block = Some(3);
-        cli.max_block = Some(99);
-        cli.min_repeats = Some(4);
+        cli.short_min_block = Some(3);
+        cli.short_max_block = Some(99);
+        cli.short_repeats = Some(4);
+        cli.long_max_block = Some(500);
         cli.max_retries = Some(9);
         cli.prompt = Some("keep going".into());
         let cfg = load(&cli).unwrap();
         assert_eq!(cfg.listen, "1.2.3.4:1");
         assert_eq!(cfg.upstream, "http://x:2");
-        assert_eq!(cfg.min_block, 3);
-        assert_eq!(cfg.max_block, 99);
-        assert_eq!(cfg.min_repeats, 4);
+        assert_eq!(cfg.short_min_block, 3);
+        assert_eq!(cfg.short_max_block, 99);
+        assert_eq!(cfg.short_repeats, 4);
+        assert_eq!(cfg.long_max_block, 500);
         assert_eq!(cfg.max_retries, 9);
         assert_eq!(cfg.continuation_prompt, "keep going");
     }
@@ -418,17 +445,17 @@ max_retries = 7
 [server]
 listen = "0.0.0.0:9999"
 [detection]
-min_block = 5
-max_block = 500
+short_min_block = 5
+short_max_block = 500
 "#,
         );
         let mut cli = cli_with_config(&p);
         cli.listen = Some("9.9.9.9:8".into());
-        cli.min_block = Some(42);
+        cli.short_min_block = Some(42);
         let cfg = load(&cli).unwrap();
         assert_eq!(cfg.listen, "9.9.9.9:8"); // CLI wins
-        assert_eq!(cfg.min_block, 42); // CLI wins
-        assert_eq!(cfg.max_block, 500); // from TOML (no CLI override)
+        assert_eq!(cfg.short_min_block, 42); // CLI wins
+        assert_eq!(cfg.short_max_block, 500); // from TOML (no CLI override)
     }
 
     // C5: --no-detection overrides file's enabled=true.

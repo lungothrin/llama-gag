@@ -67,9 +67,10 @@ endpoint = "http://127.0.0.1:8080"
 
 [detection]
 enabled = true
-min_block = 10      # minimum repeated-block length, in characters
-max_block = 2048    # maximum repeated-block length, in characters
-min_repeats = 3     # consecutive repeats needed to trigger
+short_min_block = 8   # short tier: min repeated-block length (chars)
+short_max_block = 64  # short tier: max repeated-block length (chars)
+short_repeats = 3     # short tier: consecutive repeats needed to trigger
+long_max_block = 2048 # long tier: max block length (triggers after 2 repeats)
 
 [continuation]
 prompt = "Continue from where you left off. Do not repeat any content already generated."
@@ -95,9 +96,10 @@ level = "info"      # trace | debug | info | warn | error
 | `--upstream <URL>` | Upstream llama-server endpoint | `http://127.0.0.1:8080` |
 | `--max-body-size <N>` | Maximum request body size (bytes) | `67108864` (64 MiB) |
 | `--detection` / `--no-detection` | Enable / disable loop detection | enabled |
-| `--min-block <N>` | Minimum repeated-block length (chars) | `10` |
-| `--max-block <N>` | Maximum repeated-block length (chars) | `2048` |
-| `--min-repeats <N>` | Consecutive repeats needed to trigger | `3` |
+| `--short-min-block <N>` | Short tier: min repeated-block length (chars) | `8` |
+| `--short-max-block <N>` | Short tier: max repeated-block length (chars) | `64` |
+| `--short-repeats <N>` | Short tier: consecutive repeats needed to trigger | `3` |
+| `--long-max-block <N>` | Long tier: max block length (triggers after 2 repeats) | `2048` |
 | `--prompt <TEXT>` | Continuation prompt | see `config.toml` |
 | `--max-retries <N>` | Max continuation retries | `3` |
 | `--auto-close` / `--no-auto-close` | Enable / disable auto-closing block markers | enabled |

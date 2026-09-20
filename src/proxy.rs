@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::continuation::{build_continuation_messages, dedup};
-use crate::detector::{LoopDetector, LoopHit};
+use crate::detector::{LoopHit, TieredDetector};
 use crate::passthrough;
 use crate::server::AppState;
 use crate::sse::{delta_content, delta_reasoning, has_finish_reason, is_usage, SseEvent, SseParser};
@@ -156,10 +156,10 @@ pub struct ProxyStream {
     messages: Value,
     /// Loop detector for the current response's `content` (reset per response
     /// and whenever a new content segment begins).
-    detector: Option<LoopDetector>,
+    detector: Option<TieredDetector>,
     /// Loop detector for the current response's `reasoning_content` (reset per
     /// response and whenever a new reasoning segment begins).
-    reasoning_detector: Option<LoopDetector>,
+    reasoning_detector: Option<TieredDetector>,
     /// Accumulated `delta.content` for the current response.
     full_text: String,
     /// Accumulated `delta.reasoning_content` for the current response.
@@ -200,15 +200,17 @@ impl ProxyStream {
             .get("messages")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        let detector = Some(LoopDetector::new(
-            cfg.min_block,
-            cfg.max_block,
-            cfg.min_repeats,
+        let detector = Some(TieredDetector::new(
+            cfg.short_min_block,
+            cfg.short_max_block,
+            cfg.short_repeats,
+            cfg.long_max_block,
         ));
-        let reasoning_detector = Some(LoopDetector::new(
-            cfg.min_block,
-            cfg.max_block,
-            cfg.min_repeats,
+        let reasoning_detector = Some(TieredDetector::new(
+            cfg.short_min_block,
+            cfg.short_max_block,
+            cfg.short_repeats,
+            cfg.long_max_block,
         ));
         let messages = original_messages.clone();
         ProxyStream {
@@ -389,17 +391,19 @@ impl ProxyStream {
                         if cur != last {
                             if cur {
                                 // Switching to reasoning: reset content detector.
-                                self.detector = Some(LoopDetector::new(
-                                    self.cfg.min_block,
-                                    self.cfg.max_block,
-                                    self.cfg.min_repeats,
+                                self.detector = Some(TieredDetector::new(
+                                    self.cfg.short_min_block,
+                                    self.cfg.short_max_block,
+                                    self.cfg.short_repeats,
+                                    self.cfg.long_max_block,
                                 ));
                             } else {
                                 // Switching to content: reset reasoning detector.
-                                self.reasoning_detector = Some(LoopDetector::new(
-                                    self.cfg.min_block,
-                                    self.cfg.max_block,
-                                    self.cfg.min_repeats,
+                                self.reasoning_detector = Some(TieredDetector::new(
+                                    self.cfg.short_min_block,
+                                    self.cfg.short_max_block,
+                                    self.cfg.short_repeats,
+                                    self.cfg.long_max_block,
                                 ));
                             }
                         }
@@ -516,15 +520,17 @@ impl ProxyStream {
             self.reasoning_text.clear();
             self.last_was_reasoning = None;
             self.finish_reason_seen = false;
-            self.detector = Some(LoopDetector::new(
-                self.cfg.min_block,
-                self.cfg.max_block,
-                self.cfg.min_repeats,
+            self.detector = Some(TieredDetector::new(
+                self.cfg.short_min_block,
+                self.cfg.short_max_block,
+                self.cfg.short_repeats,
+                self.cfg.long_max_block,
             ));
-            self.reasoning_detector = Some(LoopDetector::new(
-                self.cfg.min_block,
-                self.cfg.max_block,
-                self.cfg.min_repeats,
+            self.reasoning_detector = Some(TieredDetector::new(
+                self.cfg.short_min_block,
+                self.cfg.short_max_block,
+                self.cfg.short_repeats,
+                self.cfg.long_max_block,
             ));
             if self.continuations >= self.cfg.max_retries {
                 // Retries exhausted: end the stream (still close any unclosed

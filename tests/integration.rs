@@ -120,8 +120,8 @@ async fn start_proxy(cfg: Config) -> Proxy {
     }
 }
 
-/// A test config pointing at the given upstream, with a small `min_block` so
-/// short test blocks can trigger the detector.
+/// A test config pointing at the given upstream, with a small
+/// `short_min_block` so short test blocks can trigger the detector.
 fn test_config(upstream: &str) -> Config {
     test_config_detection(upstream, true)
 }
@@ -132,9 +132,10 @@ fn test_config_detection(upstream: &str, detection_enabled: bool) -> Config {
         upstream: upstream.to_string(),
         max_body_size: 64 * 1024 * 1024,
         detection_enabled,
-        min_block: 4,
-        max_block: 1024,
-        min_repeats: 2,
+        short_min_block: 4,
+        short_max_block: 64,
+        short_repeats: 2,
+        long_max_block: 1024,
         continuation_prompt: "CONTINUE".to_string(),
         max_retries: 3,
         auto_close_enabled: true,
@@ -459,7 +460,7 @@ async fn d3_stream_loop_continuation() {
         let n = counter.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // First request: the model loops. "Hello " + "ABCD" x2 triggers the
-            // detector (min_block=4, min_repeats=2) at the 2nd block.
+            // detector (short_min_block=4, short_repeats=2) at the 2nd block.
             sse_response(vec![
                 content_chunk("Hello "),
                 content_chunk("ABCDABCD"),
@@ -534,8 +535,8 @@ async fn d14_reasoning_loop_continuation() {
         let n = counter.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // First request: the model loops in its reasoning. "Let me " +
-            // "ABCD" x2 triggers the reasoning detector (min_block=4,
-            // min_repeats=2) at the 2nd block.
+            // "ABCD" x2 triggers the reasoning detector (short_min_block=4,
+            // short_repeats=2) at the 2nd block.
             sse_response(vec![
                 reasoning_chunk("Let me "),
                 reasoning_chunk("ABCDABCD"),
@@ -1018,7 +1019,7 @@ async fn d12_loop_in_unclosed_block_autoclose() {
         if n == 0 {
             // First request: an OPEN think marker, then a looping block that
             // never closes the block. "THINK_OPEN" + "ABCD" x2 triggers the
-            // detector (min_block=4, min_repeats=2) at the 2nd block.
+            // detector (short_min_block=4, short_repeats=2) at the 2nd block.
             sse_response(vec![
                 content_chunk("THINK_OPEN"),
                 content_chunk("ABCDABCD"),

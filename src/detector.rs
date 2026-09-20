@@ -145,6 +145,70 @@ impl LoopDetector {
     }
 }
 
+/// Repeat count for the long tier (fixed by design, not configurable).
+pub const LONG_REPEATS: usize = 2;
+
+/// Two-tier loop detector.
+///
+/// - **Short tier**: block lengths in `[short_min, short_max]`, triggering
+///   after `short_repeats` consecutive repetitions. Catches tight, small
+///   loops (e.g. a repeated sentence fragment).
+/// - **Long tier**: block lengths in `[short_max + 1, long_max]`, triggering
+///   after [`LONG_REPEATS`] (2) consecutive repetitions. Catches large-block
+///   loops (e.g. a repeated paragraph or code section) where two copies are
+///   already obviously a loop.
+///
+/// Both tiers are fed every character; a hit from either tier is returned
+/// (the short tier wins when both fire on the same character, as it is the
+/// tighter loop). The long tier is disabled entirely when
+/// `long_max <= short_max`.
+///
+/// The long tier's primitive check rejects blocks whose fundamental period is
+/// `<= short_max`, so a short-tier block repeated fewer than `short_repeats`
+/// times is never misread as a long-tier loop.
+pub struct TieredDetector {
+    short: LoopDetector,
+    long: Option<LoopDetector>,
+}
+
+impl TieredDetector {
+    pub fn new(
+        short_min: usize,
+        short_max: usize,
+        short_repeats: usize,
+        long_max: usize,
+    ) -> Self {
+        assert!(short_min >= 1, "short_min must be >= 1");
+        assert!(short_max >= short_min, "short_max must be >= short_min");
+        assert!(short_repeats >= 1, "short_repeats must be >= 1");
+        assert!(long_max >= short_min, "long_max must be >= short_min");
+        let long = (long_max > short_max).then(|| {
+            LoopDetector::new(short_max + 1, long_max, LONG_REPEATS)
+        });
+        TieredDetector {
+            short: LoopDetector::new(short_min, short_max, short_repeats),
+            long,
+        }
+    }
+
+    /// Feed one character; return a [`LoopHit`] if either tier completes a loop.
+    pub fn feed(&mut self, c: char) -> Option<LoopHit> {
+        let short_hit = self.short.feed(c);
+        let long_hit = self.long.as_mut().and_then(|d| d.feed(c));
+        short_hit.or(long_hit)
+    }
+
+    /// Feed a whole string; return the first hit (if any).
+    pub fn feed_str(&mut self, s: &str) -> Option<LoopHit> {
+        for c in s.chars() {
+            if let Some(hit) = self.feed(c) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +416,96 @@ mod tests {
         assert_eq!(hit.block_len, 4);
         assert_eq!(hit.kept_chars, 5004);
         // The all-X prefix block is non-primitive, so it never triggered on its own.
+    }
+
+    // ---- TieredDetector ----
+
+    /// A primitive block of `len` chars with all characters distinct, so the
+    /// block has **no period at all** (`p < len`). This is required for two
+    /// reasons: (1) the long tier's primitive check rejects any block with a
+    /// period `p < short_max + 1`, and (2) a residual small period would let the
+    /// short tier fire first. ASCII has too few distinct chars for `len > 95`,
+    /// so we use CJK ideographs (each a single `char`, counted as one unit).
+    fn primitive_block(len: usize) -> String {
+        (0..len)
+            .map(|i| char::from_u32(0x4E00 + i as u32).unwrap())
+            .collect()
+    }
+
+    // T1: short-tier loop (8-char block x3 in [8, 64] x3).
+    #[test]
+    fn t1_short_tier() {
+        let mut d = TieredDetector::new(8, 64, 3, 2048);
+        let hit = d.feed_str(&"ABCDEFGH".repeat(3)).unwrap();
+        assert_eq!(hit.block_len, 8);
+        assert_eq!(hit.run, 24);
+    }
+
+    // T2: long-tier loop (100-char primitive block x2 in [65, 2048] x2).
+    #[test]
+    fn t2_long_tier() {
+        let block = primitive_block(100);
+        let mut d = TieredDetector::new(8, 64, 3, 2048);
+        let hit = d.feed_str(&format!("{block}{block}")).unwrap();
+        assert_eq!(hit.block_len, 100);
+        assert_eq!(hit.run, 200);
+    }
+
+    // T3: short block repeated only twice (< short_repeats=3) -> no trigger
+    // from either tier (the long tier sees a non-primitive 16-char block).
+    #[test]
+    fn t3_short_below_repeats() {
+        let mut d = TieredDetector::new(8, 64, 3, 2048);
+        assert!(d.feed_str(&"ABCDEFGH".repeat(2)).is_none());
+    }
+
+    // T4: the 64-char boundary belongs to the SHORT tier: x2 does not trigger,
+    // x3 does.
+    #[test]
+    fn t4_boundary_64_is_short() {
+        let block = primitive_block(64);
+        let mut d = TieredDetector::new(8, 64, 3, 2048);
+        assert!(
+            d.feed_str(&format!("{block}{block}")).is_none(),
+            "64-char block x2 must not trigger"
+        );
+        let mut d = TieredDetector::new(8, 64, 3, 2048);
+        let hit = d.feed_str(&format!("{block}{block}{block}")).unwrap();
+        assert_eq!(hit.block_len, 64);
+        assert_eq!(hit.run, 192);
+    }
+
+    // T5: long_max <= short_max -> long tier disabled.
+    #[test]
+    fn t5_long_tier_disabled() {
+        let block = primitive_block(100);
+        let mut d = TieredDetector::new(8, 64, 3, 64);
+        assert!(d.feed_str(&format!("{block}{block}")).is_none());
+    }
+
+    // T6: chunking invariance (long-tier hit).
+    #[test]
+    fn t6_chunk_invariance() {
+        let block = primitive_block(100);
+        let input = format!("{block}{block}");
+        let mut d = TieredDetector::new(8, 64, 3, 2048);
+        let base = d.feed_str(&input).unwrap();
+        for chunk in [1usize, 7, 100, 250] {
+            let mut d = TieredDetector::new(8, 64, 3, 2048);
+            let chars: Vec<char> = input.chars().collect();
+            let mut i = 0;
+            let mut got = None;
+            while i < chars.len() && got.is_none() {
+                let end = (i + chunk).min(chars.len());
+                for j in i..end {
+                    if let Some(h) = d.feed(chars[j]) {
+                        got = Some(h);
+                        break;
+                    }
+                }
+                i = end;
+            }
+            assert_eq!(got, Some(base.clone()), "chunk size {chunk} must match");
+        }
     }
 }

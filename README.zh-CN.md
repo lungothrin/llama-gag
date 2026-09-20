@@ -67,9 +67,10 @@ endpoint = "http://127.0.0.1:8080"
 
 [detection]
 enabled = true
-min_block = 10      # 最小循环块长度（字符）
-max_block = 2048    # 最大循环块长度（字符）
-min_repeats = 3     # 触发所需的连续重复次数
+short_min_block = 8   # 短块档：最小循环块长度（字符）
+short_max_block = 64  # 短块档：最大循环块长度（字符）
+short_repeats = 3     # 短块档：触发所需的连续重复次数
+long_max_block = 2048 # 长块档：最大块长度（重复 2 次即触发）
 
 [continuation]
 prompt = "Continue from where you left off. Do not repeat any content already generated."
@@ -95,9 +96,10 @@ level = "info"      # trace | debug | info | warn | error
 | `--upstream <URL>` | 上游 llama-server 地址 | `http://127.0.0.1:8080` |
 | `--max-body-size <N>` | 最大请求体大小（字节） | `67108864`（64 MiB） |
 | `--detection` / `--no-detection` | 开启 / 关闭循环检测 | 开启 |
-| `--min-block <N>` | 最小循环块长度（字符） | `10` |
-| `--max-block <N>` | 最大循环块长度（字符） | `2048` |
-| `--min-repeats <N>` | 触发所需的连续重复次数 | `3` |
+| `--short-min-block <N>` | 短块档：最小循环块长度（字符） | `8` |
+| `--short-max-block <N>` | 短块档：最大循环块长度（字符） | `64` |
+| `--short-repeats <N>` | 短块档：触发所需的连续重复次数 | `3` |
+| `--long-max-block <N>` | 长块档：最大块长度（重复 2 次即触发） | `2048` |
 | `--prompt <TEXT>` | 续写提示词 | 见 `config.toml` |
 | `--max-retries <N>` | 最大续写次数 | `3` |
 | `--auto-close` / `--no-auto-close` | 开启 / 关闭块标记自动闭合 | 开启 |
