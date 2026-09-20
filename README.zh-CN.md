@@ -60,6 +60,7 @@ cargo build --release
 ```toml
 [server]
 listen = "127.0.0.1:8090"
+# max_body_size = 67108864   # 最大请求体大小（字节，默认 64 MiB）
 
 [upstream]
 endpoint = "http://127.0.0.1:8080"
@@ -68,7 +69,7 @@ endpoint = "http://127.0.0.1:8080"
 enabled = true
 min_block = 10      # 最小循环块长度（字符）
 max_block = 2048    # 最大循环块长度（字符）
-min_repeats = 2     # 触发所需的连续重复次数
+min_repeats = 3     # 触发所需的连续重复次数
 
 [continuation]
 prompt = "Continue from where you left off. Do not repeat any content already generated."
@@ -92,10 +93,11 @@ level = "info"      # trace | debug | info | warn | error
 | `--config <PATH>` | TOML 配置文件路径 | `config.toml` |
 | `--listen <ADDR>` | 监听地址（host:port） | `127.0.0.1:8090` |
 | `--upstream <URL>` | 上游 llama-server 地址 | `http://127.0.0.1:8080` |
+| `--max-body-size <N>` | 最大请求体大小（字节） | `67108864`（64 MiB） |
 | `--detection` / `--no-detection` | 开启 / 关闭循环检测 | 开启 |
 | `--min-block <N>` | 最小循环块长度（字符） | `10` |
 | `--max-block <N>` | 最大循环块长度（字符） | `2048` |
-| `--min-repeats <N>` | 触发所需的连续重复次数 | `2` |
+| `--min-repeats <N>` | 触发所需的连续重复次数 | `3` |
 | `--prompt <TEXT>` | 续写提示词 | 见 `config.toml` |
 | `--max-retries <N>` | 最大续写次数 | `3` |
 | `--auto-close` / `--no-auto-close` | 开启 / 关闭块标记自动闭合 | 开启 |
@@ -123,5 +125,5 @@ curl http://127.0.0.1:8090/health   # 透传到上游
 ## 测试
 
 ```bash
-cargo test   # 69 个测试：56 单元 + 13 集成
+cargo test   # 72 个测试：58 单元 + 14 集成
 ```

@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         listen = %cfg.listen,
         upstream = %cfg.upstream,
+        max_body_size = cfg.max_body_size,
         detection = cfg.detection_enabled,
         min_block = cfg.min_block,
         max_block = cfg.max_block,

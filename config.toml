@@ -8,6 +8,9 @@
 [server]
 # Address the proxy listens on. Default: "127.0.0.1:8090"
 listen = "127.0.0.1:8090"
+# Maximum request body size, in bytes. Larger requests are rejected with
+# HTTP 413 before reaching a handler. Default: 67108864 (64 MiB).
+# max_body_size = 67108864
 
 [upstream]
 # Base URL of the llama-server (OpenAI-compatible) backend. Default: "http://127.0.0.1:8080"
@@ -20,8 +23,8 @@ enabled = true
 min_block = 10
 # Maximum repeated-block length, in characters. Default: 2048
 max_block = 2048
-# Minimum number of consecutive repeats to trigger a continuation. Default: 2
-min_repeats = 2
+# Minimum number of consecutive repeats to trigger a continuation. Default: 3
+min_repeats = 3
 
 [continuation]
 # User message appended (after the deduplicated assistant turn) to request
@@ -38,11 +41,9 @@ max_retries = 3
 # Default: true
 enabled = true
 # Block-marker pairs to auto-close: `open` is the opening marker, `close` the
-# closing marker appended to balance it. Default: one think-block pair.
-# NOTE: the values below are PLACEHOLDERS — replace them with the real
-# markers your model emits.
+# closing marker appended to balance it.
 blocks = [
-    { open = "<think>", close = "</think>" },
+#    { open = "<BLOCK-START>", close = "<BLOCK-END>" },
 ]
 
 [logging]

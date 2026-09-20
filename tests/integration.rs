@@ -130,6 +130,7 @@ fn test_config_detection(upstream: &str, detection_enabled: bool) -> Config {
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream: upstream.to_string(),
+        max_body_size: 64 * 1024 * 1024,
         detection_enabled,
         min_block: 4,
         max_block: 1024,

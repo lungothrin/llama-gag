@@ -60,6 +60,7 @@ A full example is provided in [`config.toml`](config.toml):
 ```toml
 [server]
 listen = "127.0.0.1:8090"
+# max_body_size = 67108864   # max request body in bytes (default 64 MiB)
 
 [upstream]
 endpoint = "http://127.0.0.1:8080"
@@ -68,7 +69,7 @@ endpoint = "http://127.0.0.1:8080"
 enabled = true
 min_block = 10      # minimum repeated-block length, in characters
 max_block = 2048    # maximum repeated-block length, in characters
-min_repeats = 2     # consecutive repeats needed to trigger
+min_repeats = 3     # consecutive repeats needed to trigger
 
 [continuation]
 prompt = "Continue from where you left off. Do not repeat any content already generated."
@@ -92,10 +93,11 @@ level = "info"      # trace | debug | info | warn | error
 | `--config <PATH>` | Path to the TOML config file | `config.toml` |
 | `--listen <ADDR>` | Listen address (host:port) | `127.0.0.1:8090` |
 | `--upstream <URL>` | Upstream llama-server endpoint | `http://127.0.0.1:8080` |
+| `--max-body-size <N>` | Maximum request body size (bytes) | `67108864` (64 MiB) |
 | `--detection` / `--no-detection` | Enable / disable loop detection | enabled |
 | `--min-block <N>` | Minimum repeated-block length (chars) | `10` |
 | `--max-block <N>` | Maximum repeated-block length (chars) | `2048` |
-| `--min-repeats <N>` | Consecutive repeats needed to trigger | `2` |
+| `--min-repeats <N>` | Consecutive repeats needed to trigger | `3` |
 | `--prompt <TEXT>` | Continuation prompt | see `config.toml` |
 | `--max-retries <N>` | Max continuation retries | `3` |
 | `--auto-close` / `--no-auto-close` | Enable / disable auto-closing block markers | enabled |
@@ -123,5 +125,5 @@ To troubleshoot, run with `--log-level debug` (optionally `--log-file /tmp/llama
 ## Tests
 
 ```bash
-cargo test   # 69 tests: 56 unit + 13 integration
+cargo test   # 72 tests: 58 unit + 14 integration
 ```

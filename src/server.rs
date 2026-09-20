@@ -10,7 +10,7 @@
 //! does NOT match the completions route and falls through to the fallback.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -30,10 +30,14 @@ pub struct AppState {
 
 /// Build the application router.
 pub fn router(client: Client, cfg: Config) -> Router {
+    let max_body_size = cfg.max_body_size;
     let state = AppState { client, cfg };
     Router::new()
         .route("/v1/chat/completions", post(handle_chat_completions))
         .fallback(fallback)
+        // Raise the default body limit (axum's built-in 2 MiB) so large
+        // chat-completion payloads are not rejected with HTTP 413.
+        .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }
 

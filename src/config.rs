@@ -32,6 +32,10 @@ pub struct Cli {
     #[arg(long)]
     pub upstream: Option<String>,
 
+    /// Maximum request body size in bytes (overrides file).
+    #[arg(long)]
+    pub max_body_size: Option<usize>,
+
     /// Enable loop detection (overrides file).
     #[arg(long)]
     pub detection: bool,
@@ -82,6 +86,9 @@ pub struct Cli {
 pub struct Config {
     pub listen: String,
     pub upstream: String,
+    /// Maximum request body size, in bytes. Requests larger than this are
+    /// rejected with HTTP 413 before reaching a handler.
+    pub max_body_size: usize,
     pub detection_enabled: bool,
     pub min_block: usize,
     pub max_block: usize,
@@ -103,10 +110,11 @@ impl Default for Config {
         Self {
             listen: "127.0.0.1:8090".to_string(),
             upstream: "http://127.0.0.1:8080".to_string(),
+            max_body_size: 64 * 1024 * 1024,
             detection_enabled: true,
             min_block: 10,
             max_block: 2048,
-            min_repeats: 2,
+            min_repeats: 3,
             continuation_prompt: "Continue from where you left off. Do not repeat any content already generated."
                 .to_string(),
             max_retries: 3,
@@ -165,6 +173,7 @@ struct FileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct ServerSection {
     listen: Option<String>,
+    max_body_size: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,6 +221,9 @@ pub fn load(cli: &Cli) -> Result<Config, String> {
         if let Some(v) = file.server.listen {
             cfg.listen = v;
         }
+        if let Some(v) = file.server.max_body_size {
+            cfg.max_body_size = v;
+        }
         if let Some(v) = file.upstream.endpoint {
             cfg.upstream = v;
         }
@@ -253,6 +265,9 @@ pub fn load(cli: &Cli) -> Result<Config, String> {
     }
     if let Some(v) = &cli.upstream {
         cfg.upstream = v.clone();
+    }
+    if let Some(v) = cli.max_body_size {
+        cfg.max_body_size = v;
     }
     if cli.no_detection {
         cfg.detection_enabled = false;
@@ -303,6 +318,7 @@ mod tests {
             config: path.to_string(),
             listen: None,
             upstream: None,
+            max_body_size: None,
             detection: false,
             no_detection: false,
             min_block: None,
@@ -338,7 +354,7 @@ mod tests {
         assert!(cfg.detection_enabled);
         assert_eq!(cfg.min_block, 10);
         assert_eq!(cfg.max_block, 2048);
-        assert_eq!(cfg.min_repeats, 2);
+        assert_eq!(cfg.min_repeats, 3);
         assert_eq!(cfg.max_retries, 3);
         assert!(!cfg.continuation_prompt.is_empty());
     }
@@ -520,5 +536,24 @@ file = "/tmp/llama-gag.log"
         let cfg = load(&cli).unwrap();
         assert_eq!(cfg.log_level, "trace");
         assert_eq!(cfg.log_file.as_deref(), Some("/tmp/other.log"));
+    }
+
+    // C13: max_body_size default, TOML, and CLI override.
+    #[test]
+    fn c13_max_body_size() {
+        // Default: 64 MiB.
+        let cfg = load(&default_cli()).unwrap();
+        assert_eq!(cfg.max_body_size, 64 * 1024 * 1024);
+
+        // TOML [server] section.
+        let p = write_temp_toml("[server]\nmax_body_size = 123456\n");
+        let cfg = load(&cli_with_config(&p)).unwrap();
+        assert_eq!(cfg.max_body_size, 123456);
+
+        // CLI overrides TOML.
+        let mut cli = cli_with_config(&p);
+        cli.max_body_size = Some(999);
+        let cfg = load(&cli).unwrap();
+        assert_eq!(cfg.max_body_size, 999);
     }
 }
