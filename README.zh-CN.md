@@ -15,7 +15,6 @@
 
 - **增量循环检测**，零额外延迟——内容到达即透传给客户端；
 - **透明续写**——检测到循环后丢弃当前响应，自动发起续写请求（去重后的上下文 + 续写提示），客户端看到的是一条连续的流；
-- **自动闭合未闭合的块标记**（如 `think`）——保留思考内容，只补闭合标记；
 - **对 VS Code 完全透明**——把内置 Custom Endpoint 指向代理即可，无需插件。
 
 非流式请求和其他路由（`/v1/models`、`/health` 等）均为纯透传。
@@ -70,17 +69,11 @@ enabled = true
 short_min_block = 8   # 短块档：最小循环块长度（字符）
 short_max_block = 64  # 短块档：最大循环块长度（字符）
 short_repeats = 3     # 短块档：触发所需的连续重复次数
-long_max_block = 2048 # 长块档：最大块长度（重复 2 次即触发）
+long_max_block = 4096 # 长块档：最大块长度（重复 2 次即触发）
 
 [continuation]
 prompt = "Continue from where you left off. Do not repeat any content already generated."
 max_retries = 3     # 最大续写次数
-
-[auto_close]
-enabled = true
-blocks = [
-    { open = "think", close = "/think" },
-]
 
 [logging]
 level = "info"      # trace | debug | info | warn | error
@@ -99,10 +92,9 @@ level = "info"      # trace | debug | info | warn | error
 | `--short-min-block <N>` | 短块档：最小循环块长度（字符） | `8` |
 | `--short-max-block <N>` | 短块档：最大循环块长度（字符） | `64` |
 | `--short-repeats <N>` | 短块档：触发所需的连续重复次数 | `3` |
-| `--long-max-block <N>` | 长块档：最大块长度（重复 2 次即触发） | `2048` |
+| `--long-max-block <N>` | 长块档：最大块长度（重复 2 次即触发） | `4096` |
 | `--prompt <TEXT>` | 续写提示词 | 见 `config.toml` |
 | `--max-retries <N>` | 最大续写次数 | `3` |
-| `--auto-close` / `--no-auto-close` | 开启 / 关闭块标记自动闭合 | 开启 |
 | `--log-level <LEVEL>` | `trace` \| `debug` \| `info` \| `warn` \| `error` | `info` |
 | `--log-file <PATH>` | 日志写入文件（不再输出控制台） | 控制台 |
 
@@ -119,7 +111,7 @@ curl http://127.0.0.1:8090/health   # 透传到上游
 每个请求都有一个短 ID（`req-1`、`req-2`、...），出现在该请求的所有日志行中，便于关联并发请求。关键事件：
 
 - `info` — 请求接收、循环检测命中（块长度、重复次数、保留字符数）、流结束（原因 + 续写次数）
-- `debug` — 透传决策、续写请求、自动闭合注入
+- `debug` — 透传决策、续写请求
 - `warn` — 上游错误、非 2xx 响应
 
 排查问题时可用 `--log-level debug`（可配合 `--log-file /tmp/llama-gag.log`）。
@@ -127,5 +119,7 @@ curl http://127.0.0.1:8090/health   # 透传到上游
 ## 测试
 
 ```bash
-cargo test   # 72 个测试：58 单元 + 14 集成
+cargo test   # 72 个测试：60 单元 + 12 集成
 ```
+
+仅使用 **Qwen3.8** 模型进行过验证，其它模型未验证。

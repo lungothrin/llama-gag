@@ -7,15 +7,6 @@ use std::path::Path;
 use clap::Parser;
 use serde::Deserialize;
 
-/// A block-marker pair that the proxy auto-closes when a loop is detected
-/// inside an unclosed block. `open` is the opening marker, `close` the closing
-/// marker appended to balance it.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct BlockMarker {
-    pub open: String,
-    pub close: String,
-}
-
 /// Command-line arguments. Any value provided here overrides the config file.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "llama-gag", version, about = "Loop-detection proxy for llama-server")]
@@ -69,14 +60,6 @@ pub struct Cli {
     #[arg(long)]
     pub max_retries: Option<usize>,
 
-    /// Enable auto-closing of unclosed block markers (overrides file).
-    #[arg(long)]
-    pub auto_close: bool,
-
-    /// Disable auto-closing of unclosed block markers (overrides file).
-    #[arg(long)]
-    pub no_auto_close: bool,
-
     /// Log level: trace, debug, info, warn, or error (overrides file).
     #[arg(long)]
     pub log_level: Option<String>,
@@ -105,10 +88,6 @@ pub struct Config {
     pub long_max_block: usize,
     pub continuation_prompt: String,
     pub max_retries: usize,
-    /// Whether to auto-close unclosed block markers on continuation.
-    pub auto_close_enabled: bool,
-    /// The block-marker pairs to auto-close (open -> close).
-    pub auto_close_blocks: Vec<BlockMarker>,
     /// Log level (trace/debug/info/warn/error).
     pub log_level: String,
     /// Optional log file; when set, logs go to the file (not the console).
@@ -125,14 +104,10 @@ impl Default for Config {
             short_min_block: 8,
             short_max_block: 64,
             short_repeats: 3,
-            long_max_block: 2048,
+            long_max_block: 4096,
             continuation_prompt: "Continue from where you left off. Do not repeat any content already generated."
                 .to_string(),
             max_retries: 3,
-            auto_close_enabled: true,
-            // No block markers by default: auto-close is a no-op until the user
-            // configures `auto_close.blocks` (e.g. the real think-block markers).
-            auto_close_blocks: Vec::new(),
             log_level: "info".to_string(),
             log_file: None,
         }
@@ -157,11 +132,6 @@ impl Config {
         if self.max_retries == 0 {
             return Err("continuation.max_retries must be >= 1".into());
         }
-        for (i, b) in self.auto_close_blocks.iter().enumerate() {
-            if b.open.is_empty() || b.close.is_empty() {
-                return Err(format!("auto_close.blocks[{i}] open and close must be non-empty"));
-            }
-        }
         Ok(())
     }
 }
@@ -178,8 +148,6 @@ struct FileConfig {
     detection: DetectionSection,
     #[serde(default)]
     continuation: ContinuationSection,
-    #[serde(default)]
-    auto_close: AutoCloseSection,
     #[serde(default)]
     logging: LoggingSection,
 }
@@ -208,12 +176,6 @@ struct DetectionSection {
 struct ContinuationSection {
     prompt: Option<String>,
     max_retries: Option<usize>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct AutoCloseSection {
-    enabled: Option<bool>,
-    blocks: Option<Vec<BlockMarker>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -263,12 +225,6 @@ pub fn load(cli: &Cli) -> Result<Config, String> {
         if let Some(v) = file.continuation.max_retries {
             cfg.max_retries = v;
         }
-        if let Some(v) = file.auto_close.enabled {
-            cfg.auto_close_enabled = v;
-        }
-        if let Some(v) = file.auto_close.blocks {
-            cfg.auto_close_blocks = v;
-        }
         if let Some(v) = file.logging.level {
             cfg.log_level = v;
         }
@@ -310,11 +266,6 @@ pub fn load(cli: &Cli) -> Result<Config, String> {
     if let Some(v) = cli.max_retries {
         cfg.max_retries = v;
     }
-    if cli.no_auto_close {
-        cfg.auto_close_enabled = false;
-    } else if cli.auto_close {
-        cfg.auto_close_enabled = true;
-    }
     if let Some(v) = &cli.log_level {
         cfg.log_level = v.clone();
     }
@@ -348,8 +299,6 @@ mod tests {
             long_max_block: None,
             prompt: None,
             max_retries: None,
-            auto_close: false,
-            no_auto_close: false,
             log_level: None,
             log_file: None,
         }
@@ -377,7 +326,7 @@ mod tests {
         assert_eq!(cfg.short_min_block, 8);
         assert_eq!(cfg.short_max_block, 64);
         assert_eq!(cfg.short_repeats, 3);
-        assert_eq!(cfg.long_max_block, 2048);
+        assert_eq!(cfg.long_max_block, 4096);
         assert_eq!(cfg.max_retries, 3);
         assert!(!cfg.continuation_prompt.is_empty());
     }
@@ -481,59 +430,6 @@ short_max_block = 500
         let p = write_temp_toml("listen = \n");
         let err = load(&cli_with_config(&p)).unwrap_err();
         assert!(err.contains("failed to parse config file"), "got: {err}");
-    }
-
-    // C8: auto_close defaults (enabled, no block markers).
-    #[test]
-    fn c8_auto_close_defaults() {
-        let cfg = load(&default_cli()).unwrap();
-        assert!(cfg.auto_close_enabled);
-        assert!(cfg.auto_close_blocks.is_empty());
-    }
-
-    // C9: TOML auto_close section (enabled + custom blocks).
-    #[test]
-    fn c9_auto_close_toml() {
-        let p = write_temp_toml(
-            r#"
-[auto_close]
-enabled = false
-blocks = [
-    { open = "A", close = "B" },
-    { open = "C", close = "D" },
-]
-"#,
-        );
-        let cfg = load(&cli_with_config(&p)).unwrap();
-        assert!(!cfg.auto_close_enabled);
-        assert_eq!(cfg.auto_close_blocks.len(), 2);
-        assert_eq!(cfg.auto_close_blocks[0].open, "A");
-        assert_eq!(cfg.auto_close_blocks[0].close, "B");
-        assert_eq!(cfg.auto_close_blocks[1].open, "C");
-        assert_eq!(cfg.auto_close_blocks[1].close, "D");
-    }
-
-    // C10: --no-auto-close overrides file's enabled=true.
-    #[test]
-    fn c10_no_auto_close_cli() {
-        let p = write_temp_toml("[auto_close]\nenabled = true\n");
-        let mut cli = cli_with_config(&p);
-        cli.no_auto_close = true;
-        let cfg = load(&cli).unwrap();
-        assert!(!cfg.auto_close_enabled);
-    }
-
-    // C11: empty open/close marker -> validation error.
-    #[test]
-    fn c11_auto_close_empty_marker_invalid() {
-        let p = write_temp_toml(
-            r#"
-[auto_close]
-blocks = [ { open = "", close = "B" } ]
-"#,
-        );
-        let err = load(&cli_with_config(&p)).unwrap_err();
-        assert!(err.contains("auto_close.blocks"), "got: {err}");
     }
 
     // C12: logging defaults + TOML + CLI override.

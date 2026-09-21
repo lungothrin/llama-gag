@@ -53,8 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         short_repeats = cfg.short_repeats,
         long_max_block = cfg.long_max_block,
         max_retries = cfg.max_retries,
-        auto_close = cfg.auto_close_enabled,
-        auto_close_blocks = cfg.auto_close_blocks.len(),
         log_level = %cfg.log_level,
         log_file = ?cfg.log_file,
         "starting llama-gag"

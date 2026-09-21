@@ -177,9 +177,6 @@ pub struct ProxyStream {
     continuations: usize,
     /// Whether the stream has ended.
     done: bool,
-    /// A content chunk (closing block marker) to emit before the next
-    /// response's content, when a loop was detected inside an unclosed block.
-    pending_injection: Option<Bytes>,
     /// Whether any upstream chunk carried a non-null `finish_reason`
     /// (diagnostic: clients such as VS Code expect one before `[DONE]`).
     finish_reason_seen: bool,
@@ -231,7 +228,6 @@ impl ProxyStream {
             pending: None,
             continuations: 0,
             done: false,
-            pending_injection: None,
             finish_reason_seen: false,
         }
     }
@@ -350,18 +346,6 @@ impl ProxyStream {
     /// Process one chunk of upstream bytes: feed the detector, decide whether to
     /// continue, and return the bytes to forward to the client.
     fn process_chunk(&mut self, bytes: Bytes) -> Bytes {
-        // Prepend any pending injection (a closing block marker) before the
-        // first chunk of the continuation response.
-        let bytes = match self.pending_injection.take() {
-            Some(inj) => {
-                let mut out = Vec::with_capacity(inj.len() + bytes.len());
-                out.extend_from_slice(&inj);
-                out.extend_from_slice(&bytes);
-                Bytes::from(out)
-            }
-            None => bytes,
-        };
-
         let events = self.sse.feed(&bytes);
         let mut got_done = false;
         // `(is_reasoning, hit)`: which field's detector fired.
@@ -453,7 +437,7 @@ impl ProxyStream {
             // Deduplicate the field that looped. When the loop is in content,
             // the (complete) reasoning is preserved in full; when it is in
             // reasoning, no content has been produced yet.
-            let (mut kept_reasoning, mut kept_content) = if is_reasoning {
+            let (kept_reasoning, kept_content) = if is_reasoning {
                 (dedup(&self.reasoning_text, h.kept_chars), String::new())
             } else {
                 (self.reasoning_text.clone(), dedup(&self.full_text, h.kept_chars))
@@ -468,43 +452,6 @@ impl ProxyStream {
                 kept_len = kept_reasoning.chars().count() + kept_content.chars().count(),
                 "loop detected, continuing"
             );
-            // Auto-close unclosed block markers (e.g. a think block cut off by
-            // the loop) in the field that looped. The client already received
-            // that field's full text, so close against it; the assistant
-            // message carries the kept text, so close against that.
-            let (loop_full, loop_kept) = if is_reasoning {
-                (&self.reasoning_text, &kept_reasoning)
-            } else {
-                (&self.full_text, &kept_content)
-            };
-            let (model_suffix, client_suffix) = if self.cfg.auto_close_enabled {
-                (
-                    close_suffix(loop_kept, &self.cfg.auto_close_blocks),
-                    close_suffix(loop_full, &self.cfg.auto_close_blocks),
-                )
-            } else {
-                (String::new(), String::new())
-            };
-            if !model_suffix.is_empty() || !client_suffix.is_empty() {
-                tracing::debug!(
-                    %self.req_id,
-                    model_suffix = %model_suffix,
-                    client_suffix = %client_suffix,
-                    "auto-closing unclosed block marker(s)"
-                );
-            }
-            if is_reasoning {
-                kept_reasoning.push_str(&model_suffix);
-            } else {
-                kept_content.push_str(&model_suffix);
-            }
-            let injection = if client_suffix.is_empty() {
-                None
-            } else if is_reasoning {
-                Some(reasoning_chunk_bytes(&client_suffix))
-            } else {
-                Some(content_chunk_bytes(&client_suffix))
-            };
             // Always build from the ORIGINAL messages so continuations do not
             // accumulate across retries.
             self.messages = build_continuation_messages(
@@ -533,25 +480,18 @@ impl ProxyStream {
                 self.cfg.long_max_block,
             ));
             if self.continuations >= self.cfg.max_retries {
-                // Retries exhausted: end the stream (still close any unclosed
-                // block marker for the client).
+                // Retries exhausted: end the stream.
                 self.log_stream_end("max_retries exhausted");
                 self.done = true;
                 let mut out = Vec::with_capacity(bytes.len() + DONE.len());
-                if let Some(inj) = injection {
-                    out.extend_from_slice(&inj);
-                }
                 out.extend_from_slice(&bytes);
                 if !got_done {
                     out.extend_from_slice(DONE);
                 }
                 return Bytes::from(out);
             }
-            // Continue: emit the closing marker (if any) before the
-            // continuation content, then forward the content, stripping the
-            // [DONE] marker and any usage chunk (both belong to the discarded
-            // looping response).
-            self.pending_injection = injection;
+            // Continue: forward the content, stripping the [DONE] marker and
+            // any usage chunk (both belong to the discarded looping response).
             return Self::serialize_events(&events);
         }
 
@@ -597,61 +537,8 @@ impl ProxyStream {
         Bytes::from(out)
     }
 
-    /// Build the terminal `[DONE]` bytes, prepending any pending injection
-    /// (a closing block marker) so the client's stream stays balanced even
-    /// when the continuation fails or is exhausted.
-    fn terminal_done(&mut self) -> Bytes {
-        match self.pending_injection.take() {
-            Some(inj) => {
-                let mut out = Vec::with_capacity(inj.len() + DONE.len());
-                out.extend_from_slice(&inj);
-                out.extend_from_slice(DONE);
-                Bytes::from(out)
-            }
-            None => Bytes::copy_from_slice(DONE),
-        }
+    /// Build the terminal `[DONE]` bytes.
+    fn terminal_done(&self) -> Bytes {
+        Bytes::copy_from_slice(DONE)
     }
-}
-
-/// For each configured block-marker pair, if `text` contains more `open` than
-/// `close` occurrences, return the `close` marker repeated once per unclosed
-/// open (in config order). Empty when all blocks are balanced.
-fn close_suffix(text: &str, blocks: &[crate::config::BlockMarker]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        if b.open.is_empty() || b.close.is_empty() {
-            continue;
-        }
-        let opens = text.matches(b.open.as_str()).count();
-        let closes = text.matches(b.close.as_str()).count();
-        if opens > closes {
-            for _ in 0..(opens - closes) {
-                out.push_str(&b.close);
-            }
-        }
-    }
-    out
-}
-
-/// Build a synthetic SSE `data:` chunk carrying `delta.content` = `content`.
-/// Used to inject a closing block marker into the merged stream.
-fn content_chunk_bytes(content: &str) -> Bytes {
-    let v = json!({
-        "id": "llama-gag",
-        "object": "chat.completion.chunk",
-        "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
-    });
-    Bytes::from(format!("data: {v}\n\n"))
-}
-
-/// Build a synthetic SSE `data:` chunk carrying `delta.reasoning_content` =
-/// `reasoning`. Used to inject a closing block marker into the merged stream
-/// when the loop was detected in the reasoning field.
-fn reasoning_chunk_bytes(reasoning: &str) -> Bytes {
-    let v = json!({
-        "id": "llama-gag",
-        "object": "chat.completion.chunk",
-        "choices": [{ "index": 0, "delta": { "reasoning_content": reasoning }, "finish_reason": null }]
-    });
-    Bytes::from(format!("data: {v}\n\n"))
 }

@@ -15,7 +15,6 @@ Local LLMs can get stuck in **repetition loops**: the same sentence or code bloc
 
 - **Incremental loop detection** with zero added latency — content is passed through to the client as it arrives.
 - **Transparent continuation** — when a loop is detected, the looping response is dropped and a continuation request is issued automatically (deduplicated context + a continuation prompt). The client sees one continuous stream.
-- **Auto-closing of unclosed block markers** (e.g. `think`) — thinking content is preserved; only the closing marker is appended.
 - **Fully transparent to VS Code** — point the built-in Custom Endpoint at the proxy. No plugin required.
 
 Non-streaming requests and all other routes (`/v1/models`, `/health`, ...) are pure pass-through.
@@ -70,17 +69,11 @@ enabled = true
 short_min_block = 8   # short tier: min repeated-block length (chars)
 short_max_block = 64  # short tier: max repeated-block length (chars)
 short_repeats = 3     # short tier: consecutive repeats needed to trigger
-long_max_block = 2048 # long tier: max block length (triggers after 2 repeats)
+long_max_block = 4096 # long tier: max block length (triggers after 2 repeats)
 
 [continuation]
 prompt = "Continue from where you left off. Do not repeat any content already generated."
 max_retries = 3     # max continuation requests before giving up
-
-[auto_close]
-enabled = true
-blocks = [
-    { open = "think", close = "/think" },
-]
 
 [logging]
 level = "info"      # trace | debug | info | warn | error
@@ -99,10 +92,9 @@ level = "info"      # trace | debug | info | warn | error
 | `--short-min-block <N>` | Short tier: min repeated-block length (chars) | `8` |
 | `--short-max-block <N>` | Short tier: max repeated-block length (chars) | `64` |
 | `--short-repeats <N>` | Short tier: consecutive repeats needed to trigger | `3` |
-| `--long-max-block <N>` | Long tier: max block length (triggers after 2 repeats) | `2048` |
+| `--long-max-block <N>` | Long tier: max block length (triggers after 2 repeats) | `4096` |
 | `--prompt <TEXT>` | Continuation prompt | see `config.toml` |
 | `--max-retries <N>` | Max continuation retries | `3` |
-| `--auto-close` / `--no-auto-close` | Enable / disable auto-closing block markers | enabled |
 | `--log-level <LEVEL>` | `trace` \| `debug` \| `info` \| `warn` \| `error` | `info` |
 | `--log-file <PATH>` | Write logs to file (suppresses console) | console |
 
@@ -119,7 +111,7 @@ curl http://127.0.0.1:8090/health   # passed through to the upstream
 Every request gets a short id (`req-1`, `req-2`, ...) that appears in all of its log lines, so concurrent requests can be correlated. Key events:
 
 - `info` — request received, loop detected (block length, repeats, kept chars), stream ended (reason + continuation count)
-- `debug` — pass-through decisions, continuation requests, auto-close injections
+- `debug` — pass-through decisions, continuation requests
 - `warn` — upstream errors, non-2xx responses
 
 To troubleshoot, run with `--log-level debug` (optionally `--log-file /tmp/llama-gag.log`).
@@ -127,5 +119,7 @@ To troubleshoot, run with `--log-level debug` (optionally `--log-file /tmp/llama
 ## Tests
 
 ```bash
-cargo test   # 72 tests: 58 unit + 14 integration
+cargo test   # 72 tests: 60 unit + 12 integration
 ```
+
+Verified only with the **Qwen3.8** model; other models have not been tested.
