@@ -960,11 +960,19 @@ async fn d10_detection_disabled_passthrough() {
 #[tokio::test]
 async fn d11_upstream_non_200_passthrough() {
     let upstream = MockUpstream::start(Arc::new(|_body: &Value| {
-        // Upstream rejects the request (e.g. bad model name).
-        json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": {"message": "model not found", "type": "invalid_request_error"}}),
-        )
+        // Upstream rejects the request (e.g. bad model name), with a
+        // retry-after header (as a rate-limited upstream would send).
+        let body = serde_json::to_vec(&json!({
+            "error": {"message": "model not found", "type": "invalid_request_error"}
+        }))
+        .unwrap();
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .header("retry-after", "12")
+            .header("x-request-id", "test-123")
+            .body(Body::from(body))
+            .unwrap()
     }))
     .await;
     let proxy = start_proxy(test_config(&upstream.addr)).await;
@@ -983,6 +991,19 @@ async fn d11_upstream_non_200_passthrough() {
         .unwrap();
     // The proxy forwards the upstream status code.
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // And the upstream content-type / retry-after headers.
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("12")
+    );
+    assert_eq!(
+        resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("test-123")
+    );
     let bytes = read_all(resp).await;
     // And the upstream error body verbatim.
     let v: Value = serde_json::from_slice(&bytes).unwrap();

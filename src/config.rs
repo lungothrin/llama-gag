@@ -117,6 +117,9 @@ impl Default for Config {
 impl Config {
     /// Validate invariants; return an error message if violated.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_body_size == 0 {
+            return Err("server.max_body_size must be >= 1".into());
+        }
         if self.short_min_block == 0 {
             return Err("detection.short_min_block must be >= 1".into());
         }

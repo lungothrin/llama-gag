@@ -15,11 +15,14 @@ use llama_gag::server::router;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let cfg = config::load(&cli)?;
-    if let Err(e) = cfg.validate() {
-        eprintln!("configuration error: {e}");
-        std::process::exit(2);
-    }
+    // `load` already validates the resolved configuration.
+    let cfg = match config::load(&cli) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // Set up logging from config: a level filter plus an optional log file.
     // When a log file is configured, logs go ONLY to the file (not the console).

@@ -6,7 +6,7 @@
 //! llama-server and the response is streamed back verbatim.
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use bytes::Bytes;
 use reqwest::Client;
@@ -73,13 +73,16 @@ pub async fn passthrough(
 
     let resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+    // Forward every upstream response header except hop-by-hop ones
+    // (content-length / transfer-encoding are in the list, so hyper
+    // re-frames the body).
+    let upstream_headers = filter_headers(resp.headers());
 
     let stream = resp.bytes_stream();
     let body = Body::from_stream(stream);
     let mut response = Response::builder().status(status).body(body).unwrap();
-    if let Some(ct) = content_type {
-        response.headers_mut().insert(header::CONTENT_TYPE, ct);
+    for (name, value) in upstream_headers.iter() {
+        response.headers_mut().append(name, value.clone());
     }
     Ok(response)
 }

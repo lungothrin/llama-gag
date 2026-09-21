@@ -237,9 +237,9 @@ mod tests {
         let mut i = 0;
         while i < chars.len() {
             let end = (i + chunk_size).min(chars.len());
-            for j in i..end {
-                if let Some(hit) = d.feed(chars[j]) {
-                    return Some((j, hit));
+            for (offset, &c) in chars[i..end].iter().enumerate() {
+                if let Some(hit) = d.feed(c) {
+                    return Some((i + offset, hit));
                 }
             }
             i = end;
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn a4_block_above_max() {
         // 2000-char primitive block repeated twice; fundamental period 2000 > max_block.
-        let block: String = std::iter::repeat('A').take(1).chain(std::iter::repeat('B').take(1999)).collect();
+        let block: String = std::iter::repeat_n('A', 1).chain(std::iter::repeat_n('B', 1999)).collect();
         let input = format!("{block}{block}");
         assert_eq!(input.chars().count(), 4000);
         assert!(detect(&input, 10, 1024, 2).is_none());
@@ -497,8 +497,8 @@ mod tests {
             let mut got = None;
             while i < chars.len() && got.is_none() {
                 let end = (i + chunk).min(chars.len());
-                for j in i..end {
-                    if let Some(h) = d.feed(chars[j]) {
+                for &c in &chars[i..end] {
+                    if let Some(h) = d.feed(c) {
                         got = Some(h);
                         break;
                     }

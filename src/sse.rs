@@ -108,13 +108,47 @@ impl SseParser {
     }
 }
 
+/// All the fields the proxy extracts from a single `data:` payload, computed
+/// in one JSON parse (the hot path parses each chunk exactly once).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkFields {
+    /// `choices[0].delta.content`, if present.
+    pub content: Option<String>,
+    /// `choices[0].delta.reasoning_content`, if present.
+    pub reasoning: Option<String>,
+    /// Whether the chunk carries a non-null `choices[0].finish_reason`.
+    pub finish_reason: bool,
+    /// Whether the chunk carries a non-null `usage` object.
+    pub usage: bool,
+}
+
+/// Parse a `data:` payload once, extracting every field the proxy needs.
+///
+/// Malformed JSON yields an all-`None`/`false` result (the chunk is then
+/// treated as carrying no content, no finish reason, and no usage).
+pub fn parse_chunk(data: &str) -> ChunkFields {
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return ChunkFields::default(),
+    };
+    let delta = &v["choices"][0]["delta"];
+    ChunkFields {
+        content: delta["content"].as_str().map(str::to_string),
+        reasoning: delta["reasoning_content"].as_str().map(str::to_string),
+        finish_reason: v["choices"][0]
+            .get("finish_reason")
+            .map(|f| !f.is_null())
+            .unwrap_or(false),
+        usage: v.get("usage").map(|u| !u.is_null()).unwrap_or(false),
+    }
+}
+
 /// Extract `choices[0].delta.content` from a `data:` payload, if present.
 ///
 /// Returns `None` for non-content chunks (role-only, tool_calls, usage-only,
 /// malformed JSON). The proxy feeds the returned string to the loop detector.
 pub fn delta_content(data: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(data).ok()?;
-    v["choices"][0]["delta"]["content"].as_str().map(str::to_string)
+    parse_chunk(data).content
 }
 
 /// Extract `choices[0].delta.reasoning_content` from a `data:` payload, if
@@ -125,8 +159,7 @@ pub fn delta_content(data: &str) -> Option<String> {
 /// detector (separate from `content`) and carries it back in the continuation
 /// request so the upstream template renders it correctly.
 pub fn delta_reasoning(data: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(data).ok()?;
-    v["choices"][0]["delta"]["reasoning_content"].as_str().map(str::to_string)
+    parse_chunk(data).reasoning
 }
 
 /// Whether a `data:` payload carries a non-null `usage` object.
@@ -136,24 +169,13 @@ pub fn delta_reasoning(data: &str) -> Option<String> {
 /// response's usage, so usage chunks belonging to discarded (looping)
 /// responses must be stripped.
 pub fn is_usage(data: &str) -> bool {
-    let v: Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    v.get("usage").map(|u| !u.is_null()).unwrap_or(false)
+    parse_chunk(data).usage
 }
 
 /// Whether a `data:` payload carries a non-null `choices[0].finish_reason`
 /// (the chunk that signals the model finished generating).
 pub fn has_finish_reason(data: &str) -> bool {
-    let v: Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    v["choices"][0]
-        .get("finish_reason")
-        .map(|f| !f.is_null())
-        .unwrap_or(false)
+    parse_chunk(data).finish_reason
 }
 
 #[cfg(test)]

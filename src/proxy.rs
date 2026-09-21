@@ -3,7 +3,7 @@
 //! The handler forwards the request to the upstream llama-server and streams the
 //! response back to the client **verbatim** (pass-through, zero added latency).
 //! As bytes arrive they are parsed for `delta.content` and fed to an incremental
-//! [`LoopDetector`]. When a loop is detected the current upstream response is
+//! [`TieredDetector`]. When a loop is detected the current upstream response is
 //! dropped and a continuation request is issued (original messages + an
 //! assistant turn with the deduplicated text + a user turn with the
 //! continuation prompt). The client sees one continuous stream; intermediate
@@ -29,7 +29,7 @@ use crate::continuation::{build_continuation_messages, dedup};
 use crate::detector::{LoopHit, TieredDetector};
 use crate::passthrough;
 use crate::server::AppState;
-use crate::sse::{delta_content, delta_reasoning, has_finish_reason, is_usage, SseEvent, SseParser};
+use crate::sse::{parse_chunk, SseEvent, SseParser};
 
 const DONE: &[u8] = b"data: [DONE]\n\n";
 
@@ -117,6 +117,7 @@ pub async fn handle_chat_completions(
                 Some(Box::pin(resp.bytes_stream())),
                 req_id,
                 headers,
+                uri,
             );
             Response::builder()
                 .status(StatusCode::OK)
@@ -126,11 +127,17 @@ pub async fn handle_chat_completions(
                 .unwrap()
         }
         Ok(resp) => {
-            // Non-2xx: forward the upstream status and body.
+            // Non-2xx: forward the upstream status, body, and every
+            // non-hop-by-hop response header (content-type, retry-after, ...).
             let status = resp.status();
+            let upstream_headers = passthrough::filter_headers(resp.headers());
             tracing::warn!(%req_id, %status, "first upstream request non-2xx, forwarding");
             let b = resp.bytes().await.unwrap_or_default();
-            Response::builder().status(status).body(Body::from(b)).unwrap()
+            let mut response = Response::builder().status(status).body(Body::from(b)).unwrap();
+            for (name, value) in upstream_headers.iter() {
+                response.headers_mut().append(name, value.clone());
+            }
+            response
         }
         Err(e) => {
             tracing::warn!(%req_id, "upstream request failed: {e}");
@@ -152,6 +159,10 @@ pub struct ProxyStream {
     original_body: Value,
     /// The original `messages` array (never mutated).
     original_messages: Value,
+    /// The upstream path + query of the original request, reused for
+    /// continuation requests so they hit the same endpoint (preserving any
+    /// query string the client sent).
+    upstream_uri: Uri,
     /// Current `messages` array (original + latest continuation turns).
     messages: Value,
     /// Loop detector for the current response's `content` (reset per response
@@ -192,6 +203,7 @@ impl ProxyStream {
         first_resp: Option<ByteStream>,
         req_id: String,
         headers: HeaderMap,
+        upstream_uri: Uri,
     ) -> Self {
         let original_messages = original_body
             .get("messages")
@@ -217,6 +229,7 @@ impl ProxyStream {
             headers,
             original_body,
             original_messages,
+            upstream_uri,
             messages,
             detector,
             reasoning_detector,
@@ -283,9 +296,9 @@ impl Stream for ProxyStream {
 
             if self.pending.is_none() {
                 let body = self.build_request_body();
-                let url = format!(
-                    "{}/v1/chat/completions",
-                    self.cfg.upstream.trim_end_matches('/')
+                let url = passthrough::build_upstream_url(
+                    &self.cfg.upstream,
+                    &self.upstream_uri,
                 );
                 let n_messages = body
                     .get("messages")
@@ -354,11 +367,12 @@ impl ProxyStream {
         for ev in &events {
             match ev {
                 SseEvent::Data(payload) => {
-                    if has_finish_reason(payload) {
+                    let fields = parse_chunk(payload);
+                    if fields.finish_reason {
                         self.finish_reason_seen = true;
                     }
-                    let reasoning = delta_reasoning(payload);
-                    let content = delta_content(payload);
+                    let reasoning = fields.reasoning;
+                    let content = fields.content;
                     // Current segment: content takes precedence when both are
                     // present in one delta (content follows reasoning).
                     let cur = if content.is_some() {
@@ -526,7 +540,7 @@ impl ProxyStream {
         let mut out = Vec::new();
         for ev in events {
             if let SseEvent::Data(payload) = ev {
-                if is_usage(payload) {
+                if parse_chunk(payload).usage {
                     continue;
                 }
                 out.extend_from_slice(b"data: ");
