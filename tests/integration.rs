@@ -191,6 +191,16 @@ fn reasoning_chunk(reasoning: &str) -> String {
     format!("data: {v}\n\n")
 }
 
+/// Build a single SSE `data:` chunk carrying an arbitrary `delta` value.
+fn delta_chunk(delta: &Value) -> String {
+    let v = json!({
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }]
+    });
+    format!("data: {v}\n\n")
+}
+
 const DONE_CHUNK: &str = "data: [DONE]\n\n";
 
 /// A stream wrapper that records when it is dropped. Used to verify the proxy
@@ -1011,6 +1021,205 @@ async fn d11_upstream_non_200_passthrough() {
     assert_eq!(v["error"]["type"], "invalid_request_error");
     // Exactly one upstream request (no continuation on error).
     assert_eq!(upstream.chat_request_bodies().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// M1: non-streaming multimodal passthrough (request + response)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn m1_non_streaming_multimodal_passthrough() {
+    // Upstream response: non-streaming JSON with multimodal content array.
+    let completion = json!({
+        "id": "cmpl-mm",
+        "object": "chat.completion",
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "图中是一个卡通男孩。" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,RESP=" } }
+                ]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18 }
+    });
+
+    let value = completion.clone();
+    let mock = MockUpstream::start(Arc::new(move |_body| {
+        json_response(StatusCode::OK, &value)
+    }))
+    .await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    // Request: user message with multimodal content array (text + image_url).
+    let req_body = json!({
+        "model": "m",
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "描述这张图" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,REQ=" } }
+            ]
+        }]
+    });
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // Response body is byte-identical to the upstream's (multimodal intact).
+    let expected = serde_json::to_vec(&completion).unwrap();
+    assert_eq!(bytes, expected, "non-streaming multimodal body must be byte-identical");
+
+    // The request was forwarded verbatim (multimodal content array intact).
+    let bodies = mock.chat_request_bodies();
+    assert_eq!(bodies.len(), 1, "exactly one upstream request");
+    assert_eq!(bodies[0], req_body, "multimodal request body forwarded verbatim");
+}
+
+// ---------------------------------------------------------------------------
+// M2: streaming + multimodal request + loop -> continuation preserves
+// multimodal messages
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn m2_stream_multimodal_request_continuation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // First request: the model loops.
+            sse_response(vec![
+                content_chunk("Hello "),
+                content_chunk("ABCDABCD"),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            // Continuation: a normal completion.
+            sse_response(vec![
+                content_chunk(" (continued)"),
+                DONE_CHUNK.to_string(),
+            ])
+        }
+    });
+
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    // Request: user message with text + image_url + input_audio parts.
+    let req_body = json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "看图并听音频" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,IMG=" } },
+                { "type": "input_audio", "input_audio": { "data": "AUDIO_B64", "format": "wav" } }
+            ]
+        }]
+    });
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // Merged stream: loop prefix + continuation.
+    assert_eq!(extract_content(&bytes), "Hello ABCDABCD (continued)");
+    assert_eq!(count_done(&bytes), 1, "merged stream must have a single [DONE]");
+
+    // Two upstream requests: original + one continuation.
+    let bodies = mock.chat_request_bodies();
+    assert_eq!(bodies.len(), 2, "original + one continuation");
+
+    // The continuation request preserves the original multimodal message.
+    let cont_msgs = bodies[1].get("messages").and_then(Value::as_array).cloned().unwrap();
+    assert_eq!(cont_msgs.len(), 3);
+    assert_eq!(
+        cont_msgs[0], req_body["messages"][0],
+        "original multimodal message must be preserved in continuation"
+    );
+    assert_eq!(
+        cont_msgs[1],
+        json!({ "role": "assistant", "content": "Hello ABCD" })
+    );
+    assert_eq!(
+        cont_msgs[2],
+        json!({ "role": "user", "content": "CONTINUE" })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M3: streaming response with multimodal delta (content parts array) ->
+// byte-identical passthrough, no detection
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn m3_stream_multimodal_response_passthrough() {
+    // Upstream emits a delta whose `content` is an array (content parts),
+    // a non-standard multimodal format. The proxy must forward it verbatim
+    // and NOT feed it to the loop detector.
+    let mm_delta = json!([
+        { "type": "text", "text": "看图：" },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,OUT=" } }
+    ]);
+
+    let chunks = vec![
+        delta_chunk(&json!({ "role": "assistant" })),
+        delta_chunk(&mm_delta),
+        DONE_CHUNK.to_string(),
+    ];
+    let expected: Vec<u8> = chunks.iter().flat_map(|c| c.as_bytes().to_vec()).collect();
+
+    let mock = MockUpstream::start(Arc::new(move |_body: &Value| {
+        sse_response(chunks.clone())
+    }))
+    .await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let req_body = json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // The response is byte-identical to the upstream's (multimodal delta intact).
+    assert_eq!(bytes, expected, "multimodal delta must be forwarded byte-identically");
+
+    // No continuation was issued: exactly one upstream request.
+    assert_eq!(mock.chat_request_bodies().len(), 1, "no continuation for multimodal delta");
+
+    // Single [DONE].
+    assert_eq!(count_done(&bytes), 1);
 }
 
 

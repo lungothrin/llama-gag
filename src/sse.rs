@@ -289,4 +289,15 @@ mod tests {
         let out = p.feed(b"data: hi\r\n\r\n");
         assert_eq!(out, vec![SseEvent::Data("hi".into())]);
     }
+
+    // M4: array-form delta.content (multimodal content parts) -> no content.
+    #[test]
+    fn m4_array_content() {
+        let payload = r#"{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":[{"type":"text","text":"看图："},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA="}}]},"finish_reason":null}]}"#;
+        let fields = parse_chunk(payload);
+        assert_eq!(fields.content, None, "array content must not be extracted");
+        assert_eq!(fields.reasoning, None);
+        assert!(!fields.finish_reason);
+        assert!(!fields.usage);
+    }
 }
