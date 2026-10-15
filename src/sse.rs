@@ -70,16 +70,42 @@ impl SseParser {
         out
     }
 
+    /// The bytes needed to close any in-progress event, so that appending new
+    /// SSE text cannot glue it onto a partial line.
+    ///
+    /// * `"\n\n"` — a partial line is buffered (terminate it, then close the
+    ///   event it belongs to);
+    /// * `"\n"` — data lines are accumulated on a clean line boundary (close
+    ///   the open event);
+    /// * `""` — nothing is in progress.
+    ///
+    /// The proxy prepends this to the terminal `[DONE]` it emits when the
+    /// upstream ends mid-event; without it the `[DONE]` is glued onto the
+    /// partial line and the client never receives a terminator.
+    pub fn event_boundary(&self) -> &'static [u8] {
+        if !self.line_buf.is_empty() {
+            b"\n\n"
+        } else if !self.data_buf.is_empty() {
+            b"\n"
+        } else {
+            b""
+        }
+    }
+
     /// Process one complete line; return an event if the line terminates one.
     fn process_line(&mut self, line: &[u8]) -> Option<SseEvent> {
-        // Blank line: event boundary.
+        // Blank line: event boundary. The buffer is always consumed here, so
+        // events after `[DONE]` (llama-server emits its `usage` chunk there)
+        // start from an empty buffer instead of being joined onto `[DONE]`.
         if line.is_empty() {
-            let event = if self.data_buf.is_empty() {
+            if self.data_buf.is_empty() {
                 return None;
-            } else if self.data_buf == "[DONE]" {
+            }
+            let payload = std::mem::take(&mut self.data_buf);
+            let event = if payload == "[DONE]" {
                 SseEvent::Done
             } else {
-                SseEvent::Data(std::mem::take(&mut self.data_buf))
+                SseEvent::Data(payload)
             };
             return Some(event);
         }
@@ -299,5 +325,71 @@ mod tests {
         assert_eq!(fields.reasoning, None);
         assert!(!fields.finish_reason);
         assert!(!fields.usage);
+    }
+
+    // BUG 3: llama-server emits its `usage` chunk after `[DONE]`. The `[DONE]`
+    // event must fully consume the buffer so the following event is parsed on
+    // its own, not joined onto `[DONE]`.
+    #[test]
+    fn b12_event_after_done_is_separate() {
+        let mut p = SseParser::new();
+        let usage = r#"{"choices":[],"usage":{"total_tokens":7}}"#;
+        let input = format!("data: [DONE]\n\ndata: {usage}\n\n");
+        let out = p.feed(input.as_bytes());
+        assert_eq!(out, vec![SseEvent::Done, SseEvent::Data(usage.into())]);
+        assert_eq!(out[1].payload(), usage);
+        assert!(is_usage(out[1].payload()));
+    }
+
+    // BUG 3: same, with the events split across two feeds.
+    #[test]
+    fn b13_event_after_done_split_across_chunks() {
+        let mut p = SseParser::new();
+        let first = "data: [DONE]\n\ndata: {\"usage\":{\"total_tokens\":1}}\n";
+        let mut out = p.feed(first.as_bytes());
+        out.extend(p.feed(b"\n"));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], SseEvent::Done);
+        assert_eq!(
+            out[1],
+            SseEvent::Data(r#"{"usage":{"total_tokens":1}}"#.into())
+        );
+    }
+
+    // BUG 4: the bytes needed to close an in-progress event, so a raw `[DONE]`
+    // appended by the proxy is not glued onto a partial line.
+    #[test]
+    fn b14_event_boundary_states() {
+        // Nothing in progress -> nothing to close.
+        let p = SseParser::new();
+        assert_eq!(p.event_boundary(), b"");
+
+        // Complete event consumed on a clean boundary -> nothing in progress.
+        let mut p = SseParser::new();
+        p.feed(b"data: hi\n\n");
+        assert_eq!(p.event_boundary(), b"");
+
+        // Partial line buffered (no newline yet) -> terminate the line, then
+        // close the event it belongs to: "\n\n".
+        let mut p = SseParser::new();
+        p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"par");
+        assert_eq!(p.event_boundary(), b"\n\n");
+
+        // Complete data line on a clean boundary, event not yet closed -> one
+        // newline closes it.
+        let mut p = SseParser::new();
+        p.feed(b"data: hi\n");
+        assert_eq!(p.event_boundary(), b"\n");
+
+        // Multi-line event open -> same, one newline closes it.
+        let mut p = SseParser::new();
+        p.feed(b"data: part1\ndata: part2\n");
+        assert_eq!(p.event_boundary(), b"\n");
+
+        // A reset parser has no state to close.
+        let mut p = SseParser::new();
+        p.feed(b"data: partial");
+        let p = SseParser::new();
+        assert_eq!(p.event_boundary(), b"");
     }
 }

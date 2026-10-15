@@ -22,9 +22,13 @@ pub struct LoopHit {
     pub block_len: usize,
     /// Length of the trailing repeated region (characters) = `min_repeats * block_len`.
     pub run: usize,
-    /// Number of leading characters to keep (prefix + one block). The proxy slices
-    /// the accumulated text to this many characters as the deduplicated assistant
-    /// content for the continuation request.
+    /// Number of leading characters to keep (prefix + one block).
+    ///
+    /// The count is **relative to the characters fed to this detector**, not to
+    /// the whole response: the proxy builds a fresh detector for every response
+    /// and for every segment of a field (a content run interrupted by reasoning
+    /// gets its own detector), so the caller applies `kept_chars` to the text of
+    /// the current segment and keeps the earlier segments in full.
     pub kept_chars: usize,
 }
 

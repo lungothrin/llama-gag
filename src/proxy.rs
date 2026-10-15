@@ -25,7 +25,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::continuation::{build_continuation_messages, dedup};
+use crate::continuation::{build_continuation_messages, take_chars};
 use crate::detector::{LoopHit, TieredDetector};
 use crate::passthrough;
 use crate::server::AppState;
@@ -73,6 +73,13 @@ pub async fn handle_chat_completions(
     };
     let is_stream = parsed.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let model = parsed.get("model").and_then(Value::as_str).unwrap_or("<none>");
+    // `n > 1` asks the upstream for several parallel choices. The detector
+    // reads `choices[0]` only and feeds one shared detector per response, so a
+    // multi-choice stream would be monitored on the wrong text (missing real
+    // loops, or inventing cross-choice ones), and a continuation cannot be
+    // expressed: the assistant turn it appends is a single branch, not n
+    // alternatives. Such requests are passed through untouched.
+    let n_choices = parsed.get("n").and_then(Value::as_u64).unwrap_or(1).max(1);
     let n_messages = parsed
         .get("messages")
         .and_then(Value::as_array)
@@ -82,17 +89,19 @@ pub async fn handle_chat_completions(
         %req_id,
         %model,
         is_stream,
+        n_choices,
         detection_enabled = cfg.detection_enabled,
         messages = n_messages,
         "chat completion request received"
     );
 
-    if !is_stream || !cfg.detection_enabled {
+    if !is_stream || !cfg.detection_enabled || n_choices > 1 {
         tracing::debug!(
             %req_id,
             is_stream,
+            n_choices,
             detection_enabled = cfg.detection_enabled,
-            "passthrough (not streaming or detection disabled)"
+            "passthrough (not streaming, detection disabled, or n > 1)"
         );
         return passthrough::passthrough(&client, &cfg.upstream, method, uri, headers, body)
             .await
@@ -100,15 +109,13 @@ pub async fn handle_chat_completions(
     }
 
     // Streaming + detection: issue the first request and inspect its status.
-    // Forward the client's headers (hop-by-hop filtered) so auth (e.g.
-    // `Authorization`) reaches the upstream.
-    let headers = passthrough::filter_headers(&headers);
-    let url = passthrough::build_upstream_url(&cfg.upstream, &uri);
-    let mut req = client.post(&url);
-    for (name, value) in headers.iter() {
-        req = req.header(name, value);
-    }
-    match req.json(&parsed).send().await {
+    // Forward the client's headers (hop-by-hop filtered, plus `accept-encoding`
+    // so the upstream does not compress the stream we have to parse) so auth
+    // (e.g. `Authorization`) reaches the upstream. The body is forwarded
+    // verbatim, preserving key order and number formatting.
+    let headers = passthrough::filter_headers_for_detection(&headers);
+    let req = passthrough::build_post_with_body(&client, &cfg.upstream, &uri, &headers, body);
+    match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let stream = ProxyStream::new(
                 client,
@@ -171,10 +178,17 @@ pub struct ProxyStream {
     /// Loop detector for the current response's `reasoning_content` (reset per
     /// response and whenever a new reasoning segment begins).
     reasoning_detector: Option<TieredDetector>,
-    /// Accumulated `delta.content` for the current response.
-    full_text: String,
-    /// Accumulated `delta.reasoning_content` for the current response.
-    reasoning_text: String,
+    /// `delta.content` from content segments that are **complete** (a later
+    /// reasoning segment started, so their detector was reset). Kept in full.
+    content_segments: String,
+    /// `delta.content` of the **current** content segment — exactly the text fed
+    /// to `detector`, so a hit's `kept_chars` indexes into this string.
+    content_segment: String,
+    /// `delta.reasoning_content` from complete reasoning segments. Kept in full.
+    reasoning_segments: String,
+    /// `delta.reasoning_content` of the **current** reasoning segment — exactly
+    /// the text fed to `reasoning_detector`.
+    reasoning_segment: String,
     /// The last non-empty segment (`true` = reasoning, `false` = content),
     /// used to detect segment switches so the opposite detector can be reset.
     last_was_reasoning: Option<bool>,
@@ -233,8 +247,10 @@ impl ProxyStream {
             messages,
             detector,
             reasoning_detector,
-            full_text: String::new(),
-            reasoning_text: String::new(),
+            content_segments: String::new(),
+            content_segment: String::new(),
+            reasoning_segments: String::new(),
+            reasoning_segment: String::new(),
             last_was_reasoning: None,
             sse: SseParser::new(),
             resp: first_resp,
@@ -252,6 +268,17 @@ impl ProxyStream {
             obj.insert("messages".to_string(), self.messages.clone());
         }
         body
+    }
+
+    /// A fresh detector, built from the config. Used whenever detection restarts
+    /// (new response, new segment) so the thresholds stay in one place.
+    fn new_detector(&self) -> TieredDetector {
+        TieredDetector::new(
+            self.cfg.short_min_block,
+            self.cfg.short_max_block,
+            self.cfg.short_repeats,
+            self.cfg.long_max_block,
+        )
     }
 }
 
@@ -382,35 +409,32 @@ impl ProxyStream {
                     } else {
                         None
                     };
-                    // On a segment switch, reset the detector of the field we
-                    // are leaving so repetition is never counted across
-                    // separate thinking/content blocks.
+                    // On a segment switch, the field being left is **complete**:
+                    // move its text into the completed-segments buffer (kept in
+                    // full) and reset its detector, so repetition is never
+                    // counted across separate thinking/content blocks.
                     if let (Some(cur), Some(last)) = (cur, self.last_was_reasoning) {
                         if cur != last {
                             if cur {
-                                // Switching to reasoning: reset content detector.
-                                self.detector = Some(TieredDetector::new(
-                                    self.cfg.short_min_block,
-                                    self.cfg.short_max_block,
-                                    self.cfg.short_repeats,
-                                    self.cfg.long_max_block,
-                                ));
+                                // Switching to reasoning: content segment ends.
+                                self.content_segments.push_str(&self.content_segment);
+                                self.content_segment.clear();
+                                self.detector = Some(self.new_detector());
                             } else {
-                                // Switching to content: reset reasoning detector.
-                                self.reasoning_detector = Some(TieredDetector::new(
-                                    self.cfg.short_min_block,
-                                    self.cfg.short_max_block,
-                                    self.cfg.short_repeats,
-                                    self.cfg.long_max_block,
-                                ));
+                                // Switching to content: reasoning segment ends.
+                                self.reasoning_segments.push_str(&self.reasoning_segment);
+                                self.reasoning_segment.clear();
+                                self.reasoning_detector = Some(self.new_detector());
                             }
                         }
                     }
                     // Feed reasoning first, then content (model output order).
                     // Each field has its own detector; a hit in either triggers
-                    // a continuation.
+                    // a continuation. The segment buffer mirrors exactly what
+                    // its detector has fed, so a hit's `kept_chars` indexes into
+                    // that buffer.
                     if let Some(r) = &reasoning {
-                        self.reasoning_text.push_str(r);
+                        self.reasoning_segment.push_str(r);
                         if hit.is_none() {
                             if let Some(det) = self.reasoning_detector.as_mut() {
                                 for c in r.chars() {
@@ -423,7 +447,7 @@ impl ProxyStream {
                         }
                     }
                     if let Some(c) = &content {
-                        self.full_text.push_str(c);
+                        self.content_segment.push_str(c);
                         if hit.is_none() {
                             if let Some(det) = self.detector.as_mut() {
                                 for ch in c.chars() {
@@ -448,13 +472,33 @@ impl ProxyStream {
         // the discarded looping response). This keeps behavior independent of
         // how the upstream chunks its bytes.
         if let Some((is_reasoning, h)) = hit {
-            // Deduplicate the field that looped. When the loop is in content,
-            // the (complete) reasoning is preserved in full; when it is in
-            // reasoning, no content has been produced yet.
+            // Deduplicate the field that looped. `kept_chars` counts from the
+            // start of that field's **current segment** (its detector was reset
+            // when the segment began), so the text from earlier, completed
+            // segments of the same field is kept in full and prepended.
             let (kept_reasoning, kept_content) = if is_reasoning {
-                (dedup(&self.reasoning_text, h.kept_chars), String::new())
+                (
+                    format!(
+                        "{}{}",
+                        self.reasoning_segments,
+                        take_chars(&self.reasoning_segment, h.kept_chars)
+                    ),
+                    // Content produced so far (this response is discarded, but
+                    // everything the client already saw must be kept).
+                    format!("{}{}", self.content_segments, self.content_segment),
+                )
             } else {
-                (self.reasoning_text.clone(), dedup(&self.full_text, h.kept_chars))
+                (
+                    format!(
+                        "{}{}",
+                        self.reasoning_segments, self.reasoning_segment
+                    ),
+                    format!(
+                        "{}{}",
+                        self.content_segments,
+                        take_chars(&self.content_segment, h.kept_chars)
+                    ),
+                )
             };
             tracing::info!(
                 %self.req_id,
@@ -474,38 +518,35 @@ impl ProxyStream {
                 &kept_content,
                 &self.cfg.continuation_prompt,
             );
+            // Bytes needed to close the in-progress SSE event before appending a
+            // raw `[DONE]`; must be read before the parser is reset.
+            let boundary = self.sse.event_boundary();
             // Reset per-response state for the continuation.
             self.resp = None;
             self.sse = SseParser::new();
-            self.full_text.clear();
-            self.reasoning_text.clear();
+            self.content_segments.clear();
+            self.content_segment.clear();
+            self.reasoning_segments.clear();
+            self.reasoning_segment.clear();
             self.last_was_reasoning = None;
             self.finish_reason_seen = false;
-            self.detector = Some(TieredDetector::new(
-                self.cfg.short_min_block,
-                self.cfg.short_max_block,
-                self.cfg.short_repeats,
-                self.cfg.long_max_block,
-            ));
-            self.reasoning_detector = Some(TieredDetector::new(
-                self.cfg.short_min_block,
-                self.cfg.short_max_block,
-                self.cfg.short_repeats,
-                self.cfg.long_max_block,
-            ));
+            self.detector = Some(self.new_detector());
+            self.reasoning_detector = Some(self.new_detector());
             if self.continuations >= self.cfg.max_retries {
                 // Retries exhausted: end the stream.
                 self.log_stream_end("max_retries exhausted");
                 self.done = true;
-                let mut out = Vec::with_capacity(bytes.len() + DONE.len());
+                let mut out = Vec::with_capacity(bytes.len() + boundary.len() + DONE.len());
                 out.extend_from_slice(&bytes);
                 if !got_done {
+                    out.extend_from_slice(boundary);
                     out.extend_from_slice(DONE);
                 }
                 return Bytes::from(out);
             }
-            // Continue: forward the content, stripping the [DONE] marker and
-            // any usage chunk (both belong to the discarded looping response).
+            // Continue: forward the content, stripping the [DONE] marker, the
+            // `finish_reason` chunk, and any usage chunk (all belong to the
+            // discarded looping response).
             return Self::serialize_events(&events);
         }
 
@@ -531,16 +572,19 @@ impl ProxyStream {
         );
     }
 
-    /// Re-serialize SSE events, omitting the [DONE] marker and any `usage`
-    /// chunks. Used when a loop is detected in a chunk that also contains
-    /// [DONE] and we are continuing: the [DONE] and the usage belong to the
-    /// discarded looping response, so only the final response's usage reaches
-    /// the client.
+    /// Re-serialize SSE events, omitting the [DONE] marker, the chunk carrying
+    /// a non-null `finish_reason`, and any `usage` chunks. Used when a loop is
+    /// detected in a chunk that also contains [DONE] and we are continuing: the
+    /// terminator, the finish reason, and the usage all belong to the discarded
+    /// looping response, so the client must not see a `finish_reason` (VS Code
+    /// and other clients treat it as the end of the turn) and only the final
+    /// response's usage reaches it.
     fn serialize_events(events: &[SseEvent]) -> Bytes {
         let mut out = Vec::new();
         for ev in events {
             if let SseEvent::Data(payload) = ev {
-                if parse_chunk(payload).usage {
+                let fields = parse_chunk(payload);
+                if fields.usage || fields.finish_reason {
                     continue;
                 }
                 out.extend_from_slice(b"data: ");
@@ -551,8 +595,15 @@ impl ProxyStream {
         Bytes::from(out)
     }
 
-    /// Build the terminal `[DONE]` bytes.
+    /// Build the terminal `[DONE]` bytes, preceded by whatever is needed to
+    /// close an in-progress SSE event. Without that, a `[DONE]` arriving after
+    /// the upstream ends mid-event is glued onto a partial `data:` line and the
+    /// client never sees a terminator (it hangs waiting for one).
     fn terminal_done(&self) -> Bytes {
-        Bytes::copy_from_slice(DONE)
+        let boundary = self.sse.event_boundary();
+        let mut out = Vec::with_capacity(boundary.len() + DONE.len());
+        out.extend_from_slice(boundary);
+        out.extend_from_slice(DONE);
+        Bytes::from(out)
     }
 }

@@ -25,9 +25,32 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
+/// Request headers additionally stripped on the **detection** path.
+///
+/// The detection path rebuilds the response (it owns the merged stream, so it
+/// sets `content-type` / `cache-control` itself) and forwards the upstream body
+/// unchanged. If the upstream honors `accept-encoding` it sends a compressed
+/// body whose `content-encoding` is not part of the rebuilt response: the
+/// client would receive raw gzip bytes labelled as plain
+/// `text/event-stream`, and the detector would parse compressed bytes as text.
+/// The proxy does not decompress (reqwest has no gzip/brotli/zstd feature), so
+/// it asks for an identity-encoded stream instead.
+///
+/// The passthrough path keeps `accept-encoding`: it forwards the upstream
+/// response headers verbatim, so `content-encoding` stays consistent with the
+/// body and the client can decode it.
+const DETECTION_STRIPPED: &[&str] = &["accept-encoding"];
+
 /// True if the header should not be forwarded to the upstream.
 pub fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// True if the header must be dropped on the detection path (see
+/// `DETECTION_STRIPPED`).
+pub fn is_detection_stripped(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    is_hop_by_hop(&name) || DETECTION_STRIPPED.contains(&name.as_str())
 }
 
 /// Build the upstream URL by joining the base endpoint with the request path
@@ -48,6 +71,38 @@ pub fn filter_headers(headers: &HeaderMap) -> HeaderMap {
         out.append(name, value.clone());
     }
     out
+}
+
+/// Return a copy of `headers` with hop-by-hop headers **and** the
+/// detection-path headers removed. Used for the first request and every
+/// continuation of a detected (streaming) completion.
+pub fn filter_headers_for_detection(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        if is_detection_stripped(name.as_str()) {
+            continue;
+        }
+        out.append(name, value.clone());
+    }
+    out
+}
+
+/// Build a `POST` request carrying `body` **verbatim** (no JSON
+/// re-serialization, so key order and number formatting are preserved) with
+/// `headers` already filtered by the caller.
+pub fn build_post_with_body(
+    client: &Client,
+    base: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> reqwest::RequestBuilder {
+    let url = build_upstream_url(base, uri);
+    let mut req = client.post(url);
+    for (name, value) in headers.iter() {
+        req = req.header(name, value);
+    }
+    req.body(body)
 }
 
 /// Forward the request to the upstream and stream the response back verbatim.
@@ -90,7 +145,7 @@ pub async fn passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
+    use axum::http::header::{self, AUTHORIZATION, CONTENT_TYPE, HOST};
     use axum::http::HeaderValue;
 
     // is_hop_by_hop.
@@ -134,5 +189,54 @@ mod tests {
         assert!(filtered.get(HOST).is_none());
         assert!(filtered.get(AUTHORIZATION).is_some());
         assert!(filtered.get(CONTENT_TYPE).is_some());
+    }
+
+    // BUG 6: `accept-encoding` is stripped only on the detection path.
+    #[test]
+    fn detection_stripped_includes_accept_encoding() {
+        assert!(is_detection_stripped("accept-encoding"));
+        assert!(is_detection_stripped("Accept-Encoding"));
+        assert!(is_detection_stripped("ACCEPT-ENCODING"));
+        // Hop-by-hop headers stay stripped.
+        assert!(is_detection_stripped("host"));
+        assert!(is_detection_stripped("content-length"));
+        // Everything the upstream needs stays.
+        assert!(!is_detection_stripped("authorization"));
+        assert!(!is_detection_stripped("content-type"));
+        assert!(!is_detection_stripped("x-request-id"));
+    }
+
+    #[test]
+    fn filter_for_detection_drops_accept_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br, zstd"),
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer tok"));
+        headers.insert(HOST, HeaderValue::from_static("example.com"));
+        let filtered = filter_headers_for_detection(&headers);
+        assert!(
+            filtered.get(header::ACCEPT_ENCODING).is_none(),
+            "detection path must not ask the upstream to compress"
+        );
+        assert!(filtered.get(AUTHORIZATION).is_some());
+        assert!(filtered.get(HOST).is_none());
+    }
+
+    // The passthrough path keeps `accept-encoding`: it forwards the upstream
+    // response headers verbatim, so `content-encoding` stays consistent.
+    #[test]
+    fn passthrough_filter_keeps_accept_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br, zstd"),
+        );
+        let filtered = filter_headers(&headers);
+        assert_eq!(
+            filtered.get(header::ACCEPT_ENCODING),
+            Some(&HeaderValue::from_static("gzip, br, zstd"))
+        );
     }
 }

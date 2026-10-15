@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
@@ -36,33 +36,49 @@ type ChatHandler = Arc<dyn Fn(&Value) -> Response + Send + Sync>;
 struct MockState {
     chat: ChatHandler,
     chat_requests: Arc<Mutex<Vec<Value>>>,
+    /// Raw (unparsed) body bytes of every chat request, so tests can assert the
+    /// proxy forwards the client's body verbatim.
+    chat_raw_bodies: Arc<Mutex<Vec<Bytes>>>,
+    /// Request headers of every chat request, so tests can assert which headers
+    /// the proxy forwards.
+    chat_headers: Arc<Mutex<Vec<HeaderMap>>>,
     other_requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 struct MockUpstream {
     addr: String,
     chat_requests: Arc<Mutex<Vec<Value>>>,
+    chat_raw_bodies: Arc<Mutex<Vec<Bytes>>>,
+    chat_headers: Arc<Mutex<Vec<HeaderMap>>>,
     other_requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl MockUpstream {
     async fn start(chat: ChatHandler) -> Self {
         let chat_requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let chat_raw_bodies: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let chat_headers: Arc<Mutex<Vec<HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
         let other_requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let state = MockState {
             chat,
             chat_requests: chat_requests.clone(),
+            chat_raw_bodies: chat_raw_bodies.clone(),
+            chat_headers: chat_headers.clone(),
             other_requests: other_requests.clone(),
         };
 
         let app = Router::new()
             .route(
                 "/v1/chat/completions",
-                post(|State(s): State<MockState>, body: Bytes| async move {
-                    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    s.chat_requests.lock().unwrap().push(parsed.clone());
-                    (s.chat)(&parsed)
-                }),
+                post(
+                    |State(s): State<MockState>, headers: HeaderMap, body: Bytes| async move {
+                        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        s.chat_requests.lock().unwrap().push(parsed.clone());
+                        s.chat_raw_bodies.lock().unwrap().push(body);
+                        s.chat_headers.lock().unwrap().push(headers);
+                        (s.chat)(&parsed)
+                    },
+                ),
             )
             .fallback(|State(s): State<MockState>, method: Method, uri: Uri| async move {
                 let path = uri.path().to_string();
@@ -84,12 +100,24 @@ impl MockUpstream {
         MockUpstream {
             addr: format!("http://{addr}"),
             chat_requests,
+            chat_raw_bodies,
+            chat_headers,
             other_requests,
         }
     }
 
     fn chat_request_bodies(&self) -> Vec<Value> {
         self.chat_requests.lock().unwrap().clone()
+    }
+
+    /// The exact bytes of every chat request, in arrival order.
+    fn chat_request_raw_bodies(&self) -> Vec<Bytes> {
+        self.chat_raw_bodies.lock().unwrap().clone()
+    }
+
+    /// The request headers of every chat request, in arrival order.
+    fn chat_request_headers(&self) -> Vec<HeaderMap> {
+        self.chat_headers.lock().unwrap().clone()
     }
 
     fn other_requests(&self) -> Vec<(String, String)> {
@@ -1220,6 +1248,478 @@ async fn m3_stream_multimodal_response_passthrough() {
 
     // Single [DONE].
     assert_eq!(count_done(&bytes), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Audit regression tests (BUGs 1-7)
+// ---------------------------------------------------------------------------
+
+/// Build a single SSE `data:` chunk carrying `delta.content` **and** a non-null
+/// `finish_reason` (the chunk a server sends when the turn completes).
+fn finish_chunk(content: &str, reason: &str) -> String {
+    let v = json!({
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": reason }]
+    });
+    format!("data: {v}\n\n")
+}
+
+/// Count the `data:` events carrying a non-null `choices[0].finish_reason`.
+fn count_finish_reason(bytes: &[u8]) -> usize {
+    parse_events(bytes)
+        .iter()
+        .filter(|e| matches!(e, SseEvent::Data(p) if llama_gag::sse::has_finish_reason(p)))
+        .count()
+}
+
+/// Concatenate all `delta.reasoning_content` across the SSE events.
+fn extract_reasoning(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for ev in parse_events(bytes) {
+        if let SseEvent::Data(payload) = ev {
+            if let Some(r) = llama_gag::sse::delta_reasoning(&payload) {
+                out.push_str(&r);
+            }
+        }
+    }
+    out
+}
+
+// R1 (BUG 3): llama-server emits its `usage` chunk AFTER `[DONE]`. The parser
+// must not join it onto `[DONE]`, so the merged stream keeps a single [DONE]
+// and the usage chunk is still recognized (and stripped).
+#[tokio::test]
+async fn r1_usage_after_done_is_separate_event() {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            // Loop, then usage, then [DONE], then a second usage AFTER [DONE]
+            // (llama-server's late usage chunk), all in one chunk.
+            sse_response(vec![format!(
+                "{}{}{}{}",
+                content_chunk("ABCDABCD"),
+                usage_chunk(10, 50),
+                DONE_CHUNK,
+                usage_chunk(10, 60)
+            )])
+        } else {
+            sse_response(vec![
+                content_chunk(" (continued)"),
+                usage_chunk(10, 200),
+                DONE_CHUNK.to_string(),
+            ])
+        }
+    });
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // Single [DONE]; the pre-[DONE] usage of the discarded response stripped.
+    assert_eq!(count_done(&bytes), 1, "exactly one [DONE]");
+    assert_eq!(count_usage(&bytes), 1, "only the final response's usage forwarded");
+    assert_eq!(
+        usage_completion_tokens(&bytes),
+        Some(200),
+        "the late post-[DONE] usage must not be glued onto [DONE] and forwarded"
+    );
+    assert_eq!(extract_content(&bytes), "ABCDABCD (continued)");
+    assert_eq!(mock.chat_request_bodies().len(), 2);
+}
+
+// R2 (BUG 2): a content loop in the THIRD segment (content -> reasoning ->
+// content). `kept_chars` is relative to the detector that fired (the third
+// segment), so the assistant turn must keep segment 1 in full + the deduped
+// segment 3, not slice the whole accumulated content.
+#[tokio::test]
+async fn r2_content_loop_after_segment_switch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let first = "IMPORTANT FIRST SEGMENT. "; // 25 chars, no loop
+    let third = "THINK ABOUT IT.THINK ABOUT IT."; // 15-char block x2 -> kept 15
+    let counter = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            sse_response(vec![
+                content_chunk(first),
+                reasoning_chunk("hmm "),
+                content_chunk(third),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            sse_response(vec![content_chunk(" FINAL"), DONE_CHUNK.to_string()])
+        }
+    });
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // The client sees everything forwarded from the discarded response plus the
+    // continuation (pass-through is unaffected by the fix).
+    assert_eq!(
+        extract_content(&bytes),
+        format!("{first}{third} FINAL"),
+        "client content must be the merged stream"
+    );
+    assert_eq!(extract_reasoning(&bytes), "hmm ");
+    assert_eq!(count_done(&bytes), 1);
+
+    let bodies = mock.chat_request_bodies();
+    assert_eq!(bodies.len(), 2, "original + one continuation");
+    let cont_msgs = bodies[1]["messages"].as_array().cloned().unwrap();
+    assert_eq!(cont_msgs.len(), 3);
+    // The assistant turn: reasoning segment in full; content = segment 1 (kept
+    // in full) + deduped segment 3. Before the fix this sliced the whole
+    // accumulated content from char 0 ("IMPO") and lost segment 1.
+    assert_eq!(
+        cont_msgs[1],
+        json!({
+            "role": "assistant",
+            "reasoning_content": "hmm ",
+            "content": format!("{first}THINK ABOUT IT."),
+        }),
+        "kept content must be segment 1 + deduped segment 3"
+    );
+    assert_eq!(cont_msgs[2], json!({ "role": "user", "content": "CONTINUE" }));
+}
+
+// R2b (BUG 2): a reasoning loop in the SECOND segment, after a content segment.
+// The content produced so far must be kept in full (not replaced by ""), and
+// the kept reasoning must be the deduped reasoning segment.
+#[tokio::test]
+async fn r2b_reasoning_loop_after_content() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let content1 = "answer-part-1 "; // 14 chars, no loop
+    // "REASONING-BLOCK-ONE-should-be-kept." (35) x2 + "THIN" -> loops at char 70, kept 35.
+    let reasoning1 = "REASONING-BLOCK-ONE-should-be-kept.REASONING-BLOCK-ONE-should-be-kept.THIN";
+    let counter = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            sse_response(vec![
+                content_chunk(content1),
+                reasoning_chunk(reasoning1),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            sse_response(vec![content_chunk(" FINAL"), DONE_CHUNK.to_string()])
+        }
+    });
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    assert_eq!(extract_content(&bytes), format!("{content1} FINAL"));
+    assert_eq!(extract_reasoning(&bytes), reasoning1);
+    assert_eq!(count_done(&bytes), 1);
+
+    let bodies = mock.chat_request_bodies();
+    assert_eq!(bodies.len(), 2);
+    let cont_msgs = bodies[1]["messages"].as_array().cloned().unwrap();
+    // Before the fix: content was hardcoded "" and reasoning was sliced from
+    // char 0 ("REAS").
+    assert_eq!(
+        cont_msgs[1],
+        json!({
+            "role": "assistant",
+            "reasoning_content": "REASONING-BLOCK-ONE-should-be-kept.",
+            "content": content1,
+        }),
+        "reasoning loop must keep all content so far and dedupe only the reasoning segment"
+    );
+}
+
+// R3 (BUG 1): the discarded looping response's `finish_reason` chunk must be
+// stripped, so the client sees exactly one finish_reason (the final one).
+#[tokio::test]
+async fn r3_finish_reason_of_discarded_response_stripped() {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            // The looping response ends with a finish_reason chunk + [DONE].
+            sse_response(vec![
+                content_chunk("ABCDABCD"),
+                finish_chunk("tail", "stop"),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            sse_response(vec![
+                content_chunk(" FINAL"),
+                finish_chunk("", "stop"),
+                DONE_CHUNK.to_string(),
+            ])
+        }
+    });
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    assert_eq!(extract_content(&bytes), "ABCDABCD FINAL");
+    assert_eq!(count_done(&bytes), 1);
+    // Before the fix the discarded response's finish_reason was forwarded, so
+    // clients (e.g. VS Code) saw a mid-stream "stop" before the continuation.
+    assert_eq!(
+        count_finish_reason(&bytes),
+        1,
+        "only the final response's finish_reason may reach the client"
+    );
+    assert_eq!(mock.chat_request_bodies().len(), 2);
+}
+
+// R4 (BUG 4): upstream ends mid-event (partial `data:` line, no [DONE]). The
+// proxy's terminal [DONE] must be preceded by an event boundary, so the client
+// receives a well-formed terminator.
+#[tokio::test]
+async fn r4_truncated_mid_event_emits_well_formed_done() {
+    let mock = MockUpstream::start(Arc::new(|_body: &Value| {
+        // Ends in the middle of a data line (no newline, no blank line).
+        sse_response(vec![r#"data: {"choices":[{"index":0,"delta":{"content":"partial answer"},"finish_reason":null}]}"#.to_string()])
+    }))
+    .await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // The partial event is closed by the boundary and the [DONE] stands alone.
+    assert_eq!(
+        count_done(&bytes),
+        1,
+        "the terminal [DONE] must not be glued onto the partial line"
+    );
+    assert_eq!(extract_content(&bytes), "partial answer");
+    assert_eq!(mock.chat_request_bodies().len(), 1, "no continuation (no loop)");
+}
+
+// R4b (BUG 4): max_retries exhausted with the last response ending mid-event.
+// The [DONE] appended in the exhausted branch must also be boundary-separated.
+#[tokio::test]
+async fn r4b_max_retries_exhausted_mid_event() {
+    // Every response loops (complete event) AND ends mid-event: a truncated
+    // `data:` line with no newline, so the parser has a partial line buffered
+    // when the proxy appends its terminal [DONE].
+    let looping = content_chunk("ABCDABCD");
+    let partial = r#"data: {"choices":[{"index":0,"delta":{"content":"tail""#;
+    let mock = MockUpstream::start(Arc::new(move |_body: &Value| {
+        sse_response(vec![looping.clone(), partial.to_string()])
+    }))
+    .await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .json(&json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // Original + 3 continuations, all looping.
+    assert_eq!(mock.chat_request_bodies().len(), 4);
+    assert_eq!(extract_content(&bytes), "ABCDABCD".repeat(4));
+    assert_eq!(
+        count_done(&bytes),
+        1,
+        "exactly one well-formed [DONE] after retries exhausted"
+    );
+}
+
+// R5 (BUG 5): `n > 1` must be passed through untouched — no detection, no
+// continuation, byte-identical response.
+#[tokio::test]
+async fn r5_multi_choice_n_gt_1_passthrough() {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // A payload that WOULD trigger detection if choices[0] were monitored: both
+    // choices repeat a 4-char block twice.
+    let loop_choices = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({
+                    "index": i,
+                    "delta": { "content": format!("C{i}XC{i}X") },
+                    "finish_reason": null
+                })
+            })
+            .collect()
+    };
+    let handler = Arc::new(move |body: &Value| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n_choices = body.get("n").and_then(Value::as_u64).unwrap_or(1) as usize;
+        if n == 0 {
+            sse_response(vec![
+                delta_chunk(&json!({ "content": "prefix " })),
+                delta_chunk(&json!({ "content": "ABCDABCD" })),
+                delta_chunk(&json!({ "multi": loop_choices(n_choices) })),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            sse_response(vec![content_chunk(" FINAL"), DONE_CHUNK.to_string()])
+        }
+    });
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    let raw = r#"{"model":"m","stream":true,"n":2,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .header("content-type", "application/json")
+        .body(raw.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+
+    // Byte-identical passthrough of the upstream's stream.
+    let expected: Vec<u8> = [
+        delta_chunk(&json!({ "content": "prefix " })),
+        delta_chunk(&json!({ "content": "ABCDABCD" })),
+        delta_chunk(&json!({ "multi": loop_choices(2) })),
+        DONE_CHUNK.to_string(),
+    ]
+    .iter()
+    .flat_map(|c| c.as_bytes().to_vec())
+    .collect();
+    assert_eq!(bytes, expected, "n > 1 stream must be forwarded byte-identically");
+
+    // Exactly one upstream request: no detection, no continuation.
+    let bodies = mock.chat_request_bodies();
+    assert_eq!(bodies.len(), 1, "n > 1 must never trigger a continuation");
+    assert_eq!(bodies[0]["n"], json!(2));
+    // The body is forwarded verbatim (passthrough path).
+    assert_eq!(
+        mock.chat_request_raw_bodies()[0],
+        Bytes::from(raw.to_string()),
+        "n > 1 body must be forwarded verbatim"
+    );
+    assert_eq!(count_done(&bytes), 1);
+}
+
+// R6 (BUGs 6 + 7): the detection path must not advertise `accept-encoding`
+// (the proxy cannot decompress), must keep it on the passthrough path, and
+// must forward the client's body bytes verbatim (no JSON re-serialization).
+#[tokio::test]
+async fn r6_detection_strips_accept_encoding_and_forwards_body_verbatim() {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = Arc::new(move |_body: &Value| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            sse_response(vec![
+                content_chunk("ABCDABCD"),
+                DONE_CHUNK.to_string(),
+            ])
+        } else {
+            sse_response(vec![content_chunk(" FINAL"), DONE_CHUNK.to_string()])
+        }
+    });
+    let mock = MockUpstream::start(handler).await;
+    let proxy = start_proxy(test_config(&mock.addr)).await;
+
+    // Exact bytes, with a key order and number formatting that serde_json
+    // re-serialization would not preserve.
+    let raw = r#"{"temperature":0.30,"frequency_penalty":0.0,"messages":[{"role":"user","content":"hi"}],"model":"m","stream":true}"#;
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "gzip, br, zstd")
+        .body(raw.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = read_all(resp).await;
+    assert_eq!(extract_content(&bytes), "ABCDABCD FINAL");
+    assert_eq!(count_done(&bytes), 1);
+
+    // BUG 7: the first upstream request carries the client's bytes verbatim.
+    let raws = mock.chat_request_raw_bodies();
+    assert_eq!(raws.len(), 2, "original + one continuation");
+    assert_eq!(
+        raws[0],
+        Bytes::from(raw.to_string()),
+        "detection path must forward the body verbatim (no re-serialization)"
+    );
+
+    // BUG 6: neither the first request nor the continuation asks for encoding.
+    let hdrs = mock.chat_request_headers();
+    assert_eq!(hdrs.len(), 2);
+    for (i, h) in hdrs.iter().enumerate() {
+        assert!(
+            h.get("accept-encoding").is_none(),
+            "detection path request {i} must not forward accept-encoding"
+        );
+    }
+
+    // The passthrough path (non-streaming) keeps accept-encoding: it forwards
+    // the upstream response headers verbatim, so content-encoding stays
+    // consistent with the body.
+    let resp = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.addr))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "gzip")
+        .body(r#"{"model":"m","stream":false,"messages":[]}"#.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = read_all(resp).await;
+    let hdrs = mock.chat_request_headers();
+    let last = hdrs.last().unwrap();
+    assert_eq!(
+        last.get("accept-encoding"),
+        Some(&axum::http::HeaderValue::from_static("gzip")),
+        "passthrough path must keep accept-encoding"
+    );
 }
 
 
