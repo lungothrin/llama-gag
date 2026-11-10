@@ -33,6 +33,25 @@ use crate::sse::{parse_chunk, SseEvent, SseParser};
 
 const DONE: &[u8] = b"data: [DONE]\n\n";
 
+/// A synthetic SSE chunk carrying `finish_reason: "stop"` with an empty delta.
+/// Emitted before the terminal `[DONE]` whenever a stream ends without the
+/// upstream ever sending a `finish_reason` chunk (retries exhausted, upstream
+/// stream error, upstream ending early, continuation non-2xx). Clients such as
+/// VS Code Copilot reject a stream that ends with deltas + `[DONE]` but no
+/// `finish_reason` ("Response contained no choices"), so the stream must be
+/// closed with one.
+fn finish_stop_chunk() -> &'static str {
+    static CHUNK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CHUNK.get_or_init(|| {
+        let v = json!({
+            "id": "llama-gag",
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+        format!("data: {v}\n\n")
+    })
+}
+
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 type PendingReq = Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>;
 
@@ -533,15 +552,39 @@ impl ProxyStream {
             self.detector = Some(self.new_detector());
             self.reasoning_detector = Some(self.new_detector());
             if self.continuations >= self.cfg.max_retries {
-                // Retries exhausted: end the stream.
+                // Retries exhausted: end the stream. The raw `bytes` may carry
+                // the discarded response's [DONE] (and its finish_reason, which
+                // the client then sees as the turn's terminator). When they do
+                // not, close the stream with an event boundary, a synthetic
+                // finish_reason chunk (the client has seen none: the loop hit
+                // reset `finish_reason_seen` and `serialize_events` stripped the
+                // discarded responses'), and the terminal [DONE].
                 self.log_stream_end("max_retries exhausted");
                 self.done = true;
-                let mut out = Vec::with_capacity(bytes.len() + boundary.len() + DONE.len());
-                out.extend_from_slice(&bytes);
-                if !got_done {
-                    out.extend_from_slice(boundary);
-                    out.extend_from_slice(DONE);
+                // The client must see exactly one finish_reason before the
+                // stream ends. If the triggering chunk carries one (and
+                // [DONE]), forward the bytes untouched. If it carries [DONE]
+                // without a finish_reason, re-serialize the events (dropping
+                // the raw [DONE]) and append the synthetic chunk + [DONE].
+                // If it carries neither, append the boundary, the synthetic
+                // chunk, and the terminal [DONE] to the raw bytes.
+                let has_finish = events.iter().any(|ev| match ev {
+                    SseEvent::Data(payload) => crate::sse::has_finish_reason(payload),
+                    _ => false,
+                });
+                if has_finish {
+                    return bytes;
                 }
+                let mut out: Vec<u8> = if got_done {
+                    Self::serialize_events(&events).to_vec()
+                } else {
+                    let mut v = Vec::with_capacity(bytes.len() + boundary.len());
+                    v.extend_from_slice(&bytes);
+                    v.extend_from_slice(boundary);
+                    v
+                };
+                out.extend_from_slice(finish_stop_chunk().as_bytes());
+                out.extend_from_slice(DONE);
                 return Bytes::from(out);
             }
             // Continue: forward the content, stripping the [DONE] marker, the
@@ -599,10 +642,22 @@ impl ProxyStream {
     /// close an in-progress SSE event. Without that, a `[DONE]` arriving after
     /// the upstream ends mid-event is glued onto a partial `data:` line and the
     /// client never sees a terminator (it hangs waiting for one).
+    ///
+    /// When the stream has not produced a `finish_reason` chunk
+    /// (`finish_reason_seen == false`), a synthetic one is emitted before the
+    /// `[DONE]`: clients such as VS Code Copilot reject a stream that ends with
+    /// deltas + `[DONE]` but no `finish_reason` ("Response contained no
+    /// choices").
     fn terminal_done(&self) -> Bytes {
         let boundary = self.sse.event_boundary();
-        let mut out = Vec::with_capacity(boundary.len() + DONE.len());
+        let finish: &str = if self.finish_reason_seen {
+            ""
+        } else {
+            finish_stop_chunk()
+        };
+        let mut out = Vec::with_capacity(boundary.len() + finish.len() + DONE.len());
         out.extend_from_slice(boundary);
+        out.extend_from_slice(finish.as_bytes());
         out.extend_from_slice(DONE);
         Bytes::from(out)
     }

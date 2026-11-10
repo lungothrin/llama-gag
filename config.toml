@@ -33,7 +33,23 @@ long_max_block = 4096
 # User message appended (after the deduplicated assistant turn) to request
 # continuation. Default: "Continue from where you left off. Do not repeat any
 # content already generated."
-prompt = "Continue from where you left off. Do not repeat any content already generated."
+#
+# Tuned 2026-11-10 for loops inside `reasoning_content` (the model looping in
+# the middle of its thinking). The default is counter-productive there:
+#   - "Continue from where you left off" asks the model to resume from the
+#     deduplicated tail, which is exactly the looping prefix.
+#   - "Do not repeat any content already generated" is a negation that
+#     re-primes the loop concept.
+#
+# This prompt closes the loop prefix, not the reasoning. The forced fresh prefix
+# ("Progress so far:") breaks the local token pattern the loop continues from,
+# and the analysis is explicitly resumed, so the model's thinking is not
+# truncated (important for agent/tool-call turns).
+prompt = """
+You were interrupted mid-thought. Do not resume the last sentence.
+Write one line beginning with "Progress so far:" that states what you have established,
+then continue the analysis from the next step.
+"""
 # Maximum number of continuation requests before giving up. Default: 3
 max_retries = 3
 

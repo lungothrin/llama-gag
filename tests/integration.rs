@@ -731,6 +731,15 @@ async fn d5_max_retries_exhausted() {
 
     // The stream ends with exactly one [DONE].
     assert_eq!(count_done(&bytes), 1, "exactly one [DONE] after retries exhausted");
+
+    // The stream must also carry exactly one finish_reason: clients such as
+    // VS Code Copilot reject a stream ending with deltas + [DONE] but no
+    // finish_reason ("Response contained no choices").
+    assert_eq!(
+        count_finish_reason(&bytes),
+        1,
+        "a synthetic finish_reason must close the stream after retries exhausted"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1577,11 @@ async fn r4b_max_retries_exhausted_mid_event() {
         count_done(&bytes),
         1,
         "exactly one well-formed [DONE] after retries exhausted"
+    );
+    assert_eq!(
+        count_finish_reason(&bytes),
+        1,
+        "a synthetic finish_reason must close the stream after retries exhausted"
     );
 }
 
